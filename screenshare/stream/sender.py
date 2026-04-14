@@ -25,13 +25,20 @@ from aiortc.contrib.media import MediaRelay
 from av import VideoFrame
 
 from screenshare.capture.audio import CompositeAudioTrack
+from screenshare.network.public_access import (
+    PublicJoinInfo,
+    resolve_direct_join_info,
+    resolve_relay_join_info,
+)
 from screenshare.capture.screen import ScreenCaptureWorker
 from screenshare.network.session import (
     HostSessionConfig,
+    configured_signaling_relay_url,
     ice_server_settings,
     parse_bitrate_to_kbps,
 )
-from screenshare.network.signaling import HostSignalingServer
+from screenshare.network.signaling import HostSignalingServer, RelayHostSignalingClient
+from screenshare.network.upnp import PortMappingLease
 from screenshare.stream.encoder import (
     apply_runtime_video_profile,
     build_ffmpeg_desktop_packet_command,
@@ -559,9 +566,13 @@ class HostStreamer:
         self.video_relay = MediaRelay()
         self.audio_relay = MediaRelay()
         self.signaling: HostSignalingServer | None = None
+        self.relay_signaling: RelayHostSignalingClient | None = None
         ensure_webrtc_video_codecs_registered()
         self.encoder = detect_best_encoder_for_format(config.video_codec)
         self.quality_profile = resolve_quality_profile(config.resolution_label, config.quality)
+        self.relay_url = configured_signaling_relay_url()
+        self._public_join_info: PublicJoinInfo | None = None
+        self._port_mapping: PortMappingLease | None = None
         self._use_ffmpeg_packet_pipeline = False
         self._use_direct_desktop_capture = False
         self._peers: dict[str, PeerState] = {}
@@ -685,6 +696,21 @@ class HostStreamer:
             offer_handler=self._handle_offer,
         )
         await self.signaling.start()
+        if self.relay_url:
+            self.relay_signaling = RelayHostSignalingClient(
+                self.relay_url,
+                self.config.relay_session_id,
+                self.config.pin,
+                self._handle_offer,
+                on_status=self._safe_emit_toast,
+            )
+            relay_connected = await self.relay_signaling.start()
+            if relay_connected:
+                self._safe_emit_toast("Internet relay signaling is ready.")
+            else:
+                self._safe_emit_toast(
+                    "Internet relay signaling is still connecting. LAN viewers can join immediately."
+                )
         self._safe_emit_toast(f"Encoder selected: {self.encoder.display_name}")
 
         self._stats_task = asyncio.create_task(self._stats_loop())
@@ -703,6 +729,15 @@ class HostStreamer:
         if self.signaling is not None:
             await self.signaling.stop()
             self.signaling = None
+        if self.relay_signaling is not None:
+            await self.relay_signaling.stop()
+            self.relay_signaling = None
+        if self._port_mapping is not None:
+            lease = self._port_mapping
+            self._port_mapping = None
+            with suppress(Exception):
+                await asyncio.to_thread(lease.release)
+        self._public_join_info = None
 
         peers = list(self._peers.items())
         self._peers.clear()
@@ -722,6 +757,41 @@ class HostStreamer:
         self.video_track = None
         # Give relay tasks a chance to observe the ended source track.
         await asyncio.sleep(0)
+
+    async def resolve_public_join_info(self) -> PublicJoinInfo:
+        if not self._running:
+            return PublicJoinInfo(
+                ready=False,
+                mode="unavailable",
+                join_code=None,
+                summary="Host session is not live",
+                detail="Start sharing before generating an internet join code.",
+                endpoint_text="Session not running",
+            )
+
+        if self.relay_url:
+            self._public_join_info = resolve_relay_join_info(
+                relay_url=self.relay_url,
+                session_id=self.config.relay_session_id,
+                pin=self.config.pin,
+                relay_connected=self.relay_signaling.is_connected if self.relay_signaling else False,
+            )
+            return self._public_join_info
+
+        if self._public_join_info is not None:
+            return self._public_join_info
+
+        info, lease = await asyncio.to_thread(
+            resolve_direct_join_info,
+            internal_host_ip=self.config.host_ip,
+            signaling_port=self.config.signaling_port,
+            pin=self.config.pin,
+            turn_enabled=len(ice_server_settings()) > 1,
+        )
+        self._public_join_info = info
+        if lease is not None:
+            self._port_mapping = lease
+        return info
 
     async def _handle_offer(self, payload: dict[str, Any]) -> dict[str, str]:
         if not self._running or self.video_track is None:

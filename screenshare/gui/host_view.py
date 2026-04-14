@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import queue
-import threading
 import tkinter as tk
 from concurrent.futures import Future
 from contextlib import suppress
@@ -10,6 +9,7 @@ from typing import Any
 import customtkinter as ctk
 from PIL import ImageTk
 
+from screenshare.network.public_access import PublicJoinInfo
 from screenshare.network.session import (
     FPS_PRESETS,
     QUALITY_PRESETS,
@@ -17,10 +17,9 @@ from screenshare.network.session import (
     VIDEO_CODEC_PRESETS,
     detect_local_ip,
     format_bitrate,
+    generate_public_session_id,
     generate_session_pin,
-    has_turn_server_config,
 )
-from screenshare.network.public_access import PublicJoinInfo, resolve_public_join_info
 from screenshare.stream.sender import HostStreamer
 from screenshare.stream.video_codecs import normalize_video_codec
 from screenshare.utils.resolution import available_resolution_labels, list_monitors, resolve_resolution
@@ -48,9 +47,11 @@ class HostView(ctk.CTkFrame):
         self._closing = False
         self._preview_ref: ImageTk.PhotoImage | None = None
         self._toast_window: ctk.CTkToplevel | None = None
+        self._last_public_detail = ""
 
         self.pin = generate_session_pin()
         self.host_ip = detect_local_ip()
+        self.relay_session_id = generate_public_session_id()
         self.monitors = list_monitors()
         if not self.monitors:
             raise RuntimeError("No display monitors were detected.")
@@ -262,6 +263,7 @@ class HostView(ctk.CTkFrame):
         return HostSessionConfig(
             pin=self.pin,
             host_ip=self.host_ip,
+            relay_session_id=self.relay_session_id,
             monitor_index=monitor.index,
             monitor_label=monitor.label,
             monitor_region=monitor.region,
@@ -350,6 +352,7 @@ class HostView(ctk.CTkFrame):
         self.public_code_var.set("Resolving...")
         self.public_endpoint_var.set("Public signaling endpoint is being discovered.")
         self.copy_join_code_button.configure(state="disabled")
+        self._last_public_detail = ""
         self._resolve_public_join_async()
 
     def _handle_stop_done(self, future: Future[Any]) -> None:
@@ -367,6 +370,7 @@ class HostView(ctk.CTkFrame):
         self.public_code_var.set("Waiting for session start")
         self.public_endpoint_var.set("Start sharing to resolve")
         self.copy_join_code_button.configure(state="disabled")
+        self._last_public_detail = ""
 
     def _update_preview(self, image) -> None:
         self._preview_ref = ImageTk.PhotoImage(image=image)
@@ -399,33 +403,33 @@ class HostView(ctk.CTkFrame):
     def _resolve_public_join_async(self) -> None:
         if self._service is None:
             return
+        future = self.runtime.submit(self._service.resolve_public_join_info())
+        future.add_done_callback(lambda done: _enqueue_latest(self._events, ("public_info", done)))
 
-        config = self._service.config
-        turn_enabled = has_turn_server_config()
-
-        def _worker() -> None:
-            info = resolve_public_join_info(
-                pin=config.pin,
-                signaling_port=config.signaling_port,
-                turn_enabled=turn_enabled,
-            )
-            _enqueue_latest(self._events, ("public_info", info))
-
-        threading.Thread(target=_worker, name="public-join-resolver", daemon=True).start()
-
-    def _handle_public_info(self, info: PublicJoinInfo) -> None:
+    def _handle_public_info(self, payload: PublicJoinInfo | Future[Any]) -> None:
         if self._service is None:
+            return
+        try:
+            info = payload.result() if isinstance(payload, Future) else payload
+        except Exception as exc:
+            self.public_code_var.set("Unavailable")
+            self.public_endpoint_var.set("Public endpoint unavailable")
+            self.copy_join_code_button.configure(state="disabled")
+            self._show_toast(str(exc))
             return
         if info.join_code:
             self.public_code_var.set(info.join_code)
-            self.public_endpoint_var.set(f"Public endpoint  {info.public_host}:{info.signaling_port}")
-            self.copy_join_code_button.configure(state="normal")
+            self.public_endpoint_var.set(info.endpoint_text)
+            self.copy_join_code_button.configure(state="normal" if info.ready else "disabled")
         else:
             self.public_code_var.set("Unavailable")
-            self.public_endpoint_var.set(info.summary)
+            self.public_endpoint_var.set(info.endpoint_text or info.summary)
             self.copy_join_code_button.configure(state="disabled")
-        if info.detail and not info.join_code:
+        if info.detail and info.detail != self._last_public_detail:
+            self._last_public_detail = info.detail
             self._show_toast(info.detail)
+        if not info.ready and info.mode == "relay" and self._service is not None:
+            self.after(3000, self._resolve_public_join_async)
 
     def _select_join_code(self, _event=None) -> None:
         self.public_code_entry.focus_set()

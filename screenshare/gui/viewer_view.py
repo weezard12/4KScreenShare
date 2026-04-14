@@ -180,6 +180,8 @@ class ViewerView(ctk.CTkFrame):
         host = self.host_entry.get().strip()
         pin = self.pin_entry.get().strip()
         port = DEFAULT_SIGNALING_PORT
+        relay_url = None
+        relay_session_id = None
 
         if join_code:
             try:
@@ -187,11 +189,17 @@ class ViewerView(ctk.CTkFrame):
             except JoinCodeError as exc:
                 self.show_error("Invalid join code", str(exc))
                 return
-            host = target.host
             pin = target.pin
-            port = target.port
+            if target.is_relay:
+                relay_url = target.relay_url
+                relay_session_id = target.session_id
+                host = ""
+                port = 0
+            else:
+                host = target.host or ""
+                port = target.port or DEFAULT_SIGNALING_PORT
             self.host_entry.delete(0, "end")
-            self.host_entry.insert(0, host)
+            self.host_entry.insert(0, target.display_target)
             self.pin_entry.delete(0, "end")
             self.pin_entry.insert(0, pin)
         elif not host or not pin:
@@ -207,8 +215,19 @@ class ViewerView(ctk.CTkFrame):
             )
             self._client.set_volume(self.volume_slider.get() / 100.0)
 
-        self.status_var.set(f"Connecting to {host}:{port}...")
-        future = self.runtime.submit(self._client.connect(host, pin, port))
+        if relay_url and relay_session_id:
+            self.status_var.set(f"Connecting through {target.display_target}...")
+        else:
+            self.status_var.set(f"Connecting to {host}:{port}...")
+        future = self.runtime.submit(
+            self._client.connect(
+                host,
+                pin,
+                port,
+                relay_url=relay_url,
+                relay_session_id=relay_session_id,
+            )
+        )
         future.add_done_callback(lambda done: _enqueue_latest(self._events, ("connect_done", done)))
 
     def _disconnect(self) -> None:

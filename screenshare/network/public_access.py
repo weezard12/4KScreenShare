@@ -1,37 +1,57 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import socket
 import struct
+import urllib.parse
 import zlib
 from dataclasses import dataclass
+
+from screenshare.network.upnp import PortMappingLease, try_add_tcp_port_mapping
 
 
 STUN_MAGIC_COOKIE = 0x2112A442
 STUN_BINDING_REQUEST = 0x0001
 STUN_XOR_MAPPED_ADDRESS = 0x0020
 STUN_MAPPED_ADDRESS = 0x0001
-JOIN_CODE_VERSION = 1
+JOIN_CODE_VERSION_DIRECT = 1
+JOIN_CODE_VERSION_STRUCTURED = 2
 DEFAULT_STUN_HOST = "stun.l.google.com"
 DEFAULT_STUN_PORT = 19302
 
 
 @dataclass(slots=True)
 class JoinTarget:
-    host: str
-    port: int
     pin: str
+    mode: str = "direct"
+    host: str | None = None
+    port: int | None = None
+    relay_url: str | None = None
+    session_id: str | None = None
+
+    @property
+    def is_relay(self) -> bool:
+        return self.mode == "relay" and bool(self.relay_url) and bool(self.session_id)
+
+    @property
+    def display_target(self) -> str:
+        if self.is_relay:
+            parsed = urllib.parse.urlparse(self.relay_url or "")
+            return parsed.netloc or (self.relay_url or "public relay")
+        host = self.host or "unknown host"
+        return f"{host}:{self.port or 0}"
 
 
 @dataclass(slots=True)
 class PublicJoinInfo:
-    public_host: str | None
-    signaling_port: int
-    pin: str
+    ready: bool
+    mode: str
     join_code: str | None
     summary: str
     detail: str
+    endpoint_text: str
 
 
 class JoinCodeError(ValueError):
@@ -55,7 +75,7 @@ def encode_join_code(host: str, port: int, pin: str) -> str:
 
     pin_value = int(normalized_pin)
     payload = bytearray()
-    payload.append(JOIN_CODE_VERSION)
+    payload.append(JOIN_CODE_VERSION_DIRECT)
     payload.append(family)
     payload.extend(struct.pack("!H", int(port)))
     payload.extend(packed_host)
@@ -63,58 +83,38 @@ def encode_join_code(host: str, port: int, pin: str) -> str:
     checksum = zlib.crc32(bytes(payload)) & 0xFFFF
     payload.extend(struct.pack("!H", checksum))
 
-    encoded = base64.b32encode(bytes(payload)).decode("ascii").rstrip("=")
-    return "-".join(encoded[index:index + 4] for index in range(0, len(encoded), 4))
+    return _base32_join_code(bytes(payload))
+
+
+def encode_relay_join_code(*, relay_url: str, session_id: str, pin: str) -> str:
+    normalized_pin = pin.strip()
+    if len(normalized_pin) != 6 or not normalized_pin.isdigit():
+        raise JoinCodeError("Join codes require a 6-digit session PIN.")
+
+    payload = {
+        "m": "relay",
+        "u": relay_url.rstrip("/"),
+        "s": session_id.strip().upper(),
+        "p": normalized_pin,
+    }
+    encoded_json = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    compressed = zlib.compress(encoded_json, level=9)
+    body = bytes([JOIN_CODE_VERSION_STRUCTURED]) + compressed
+    checksum = zlib.crc32(body) & 0xFFFF
+    return _base32_join_code(body + struct.pack("!H", checksum))
 
 
 def decode_join_code(code: str) -> JoinTarget:
-    normalized = "".join(character for character in code.upper() if character.isalnum())
-    if not normalized:
-        raise JoinCodeError("The join code is empty.")
-    padding = "=" * ((8 - (len(normalized) % 8)) % 8)
-    try:
-        raw = base64.b32decode(normalized + padding, casefold=True)
-    except Exception as exc:
-        raise JoinCodeError("The join code is invalid or corrupted.") from exc
-
-    if len(raw) < 10:
+    raw = _decode_base32_join_code(code)
+    if len(raw) < 3:
         raise JoinCodeError("The join code is too short.")
 
-    payload = raw[:-2]
-    expected_checksum = struct.unpack("!H", raw[-2:])[0]
-    actual_checksum = zlib.crc32(payload) & 0xFFFF
-    if expected_checksum != actual_checksum:
-        raise JoinCodeError("The join code checksum is invalid.")
-
-    version = payload[0]
-    family = payload[1]
-    if version != JOIN_CODE_VERSION:
-        raise JoinCodeError("The join code version is not supported by this app.")
-
-    try:
-        port = struct.unpack("!H", payload[2:4])[0]
-    except struct.error as exc:
-        raise JoinCodeError("The join code does not contain a valid signaling port.") from exc
-
-    if family == 0x04:
-        host_end = 8
-        if len(payload) != 11:
-            raise JoinCodeError("The join code payload is malformed.")
-        host = socket.inet_ntop(socket.AF_INET, payload[4:host_end])
-    elif family == 0x06:
-        host_end = 20
-        if len(payload) != 23:
-            raise JoinCodeError("The join code payload is malformed.")
-        host = socket.inet_ntop(socket.AF_INET6, payload[4:host_end])
-    else:
-        raise JoinCodeError("The join code address family is not supported.")
-
-    pin = f"{int.from_bytes(payload[host_end:host_end + 3], byteorder='big'):06d}"
-
-    if not host or port <= 0 or port > 65535:
-        raise JoinCodeError("The join code does not contain a complete session target.")
-
-    return JoinTarget(host=host, port=port, pin=pin)
+    version = raw[0]
+    if version == JOIN_CODE_VERSION_DIRECT:
+        return _decode_direct_join_code(raw)
+    if version == JOIN_CODE_VERSION_STRUCTURED:
+        return _decode_structured_join_code(raw)
+    raise JoinCodeError("The join code version is not supported by this app.")
 
 
 def detect_public_ip_via_stun(
@@ -139,40 +139,182 @@ def detect_public_ip_via_stun(
     return _parse_stun_response(response, transaction_id)
 
 
-def resolve_public_join_info(*, pin: str, signaling_port: int, turn_enabled: bool) -> PublicJoinInfo:
+def resolve_relay_join_info(
+    *,
+    relay_url: str,
+    session_id: str,
+    pin: str,
+    relay_connected: bool,
+) -> PublicJoinInfo:
+    join_code = encode_relay_join_code(relay_url=relay_url, session_id=session_id, pin=pin)
+    relay_host = urllib.parse.urlparse(relay_url).netloc or relay_url
+    status = "ready" if relay_connected else "connecting"
+    detail = (
+        "The host is connected to the public signaling relay."
+        if relay_connected
+        else "The host is still connecting to the public signaling relay. Internet viewers can join once the relay connection is established."
+    )
+    return PublicJoinInfo(
+        ready=relay_connected,
+        mode="relay",
+        join_code=join_code,
+        summary=f"Internet join code {status} via relay",
+        detail=detail,
+        endpoint_text=f"Relay endpoint  {relay_host}",
+    )
+
+
+def resolve_direct_join_info(
+    *,
+    internal_host_ip: str,
+    signaling_port: int,
+    pin: str,
+    turn_enabled: bool,
+) -> tuple[PublicJoinInfo, PortMappingLease | None]:
     public_host = detect_public_ip_via_stun()
     if public_host is None:
-        return PublicJoinInfo(
-            public_host=None,
-            signaling_port=signaling_port,
-            pin=pin,
-            join_code=None,
-            summary="Internet join code unavailable",
-            detail=(
-                "The app could not discover the host's public address through STUN. "
-                "LAN sharing still works. For internet sessions, ensure the signaling port is reachable "
-                "and that the network allows STUN/TURN traffic."
+        return (
+            PublicJoinInfo(
+                ready=False,
+                mode="direct",
+                join_code=None,
+                summary="Internet join unavailable",
+                detail=(
+                    "The app could not discover the host's public address through STUN. "
+                    "LAN sharing still works. For internet sessions, configure a public signaling relay or ensure the network allows STUN."
+                ),
+                endpoint_text="Public endpoint unavailable",
             ),
+            None,
         )
 
+    lease = try_add_tcp_port_mapping(
+        internal_client=internal_host_ip,
+        internal_port=signaling_port,
+        preferred_external_port=signaling_port,
+        description="4KScreenShare signaling",
+    )
+    if lease is None:
+        relay_note = (
+            "TURN is configured for media, but signaling still needs either a public relay or a reachable router mapping."
+            if turn_enabled
+            else "Configure TURN for media and use either a public relay or a reachable router mapping for signaling."
+        )
+        return (
+            PublicJoinInfo(
+                ready=False,
+                mode="direct",
+                join_code=None,
+                summary="Internet join needs router or relay setup",
+                detail=(
+                    "The host's router did not accept an automatic UPnP port mapping for signaling. "
+                    f"{relay_note} Forward TCP {signaling_port} manually or configure SCREENSHARE_SIGNALING_RELAY_URL."
+                ),
+                endpoint_text=f"Public IP detected  {public_host}",
+            ),
+            None,
+        )
+
+    external_host = lease.external_ip or public_host
+    join_code = encode_join_code(external_host, lease.external_port, pin)
     relay_note = (
-        "TURN relay is configured for restrictive NATs."
+        "TURN is configured for restrictive NATs."
         if turn_enabled
-        else "TURN relay is not configured, so some restrictive NATs may still block media."
+        else "TURN is not configured, so some restrictive NATs may still require a relay."
     )
-    join_code = encode_join_code(public_host, signaling_port, pin)
-    return PublicJoinInfo(
-        public_host=public_host,
-        signaling_port=signaling_port,
-        pin=pin,
-        join_code=join_code,
-        summary=f"Internet join code ready for {public_host}:{signaling_port}",
-        detail=(
-            "The join code resolves to the host signaling endpoint. "
-            "WebRTC will still negotiate the actual media route over ICE. "
-            f"{relay_note} Forward TCP {signaling_port} on the router if internet viewers cannot reach the host."
+    return (
+        PublicJoinInfo(
+            ready=True,
+            mode="direct",
+            join_code=join_code,
+            summary="Internet join code ready through router mapping",
+            detail=f"Automatic UPnP router mapping is active for TCP {lease.external_port}. {relay_note}",
+            endpoint_text=f"Public endpoint  {external_host}:{lease.external_port}",
         ),
+        lease,
     )
+
+
+def _base32_join_code(raw: bytes) -> str:
+    encoded = base64.b32encode(raw).decode("ascii").rstrip("=")
+    return "-".join(encoded[index:index + 4] for index in range(0, len(encoded), 4))
+
+
+def _decode_base32_join_code(code: str) -> bytes:
+    normalized = "".join(character for character in code.upper() if character.isalnum())
+    if not normalized:
+        raise JoinCodeError("The join code is empty.")
+    padding = "=" * ((8 - (len(normalized) % 8)) % 8)
+    try:
+        return base64.b32decode(normalized + padding, casefold=True)
+    except Exception as exc:
+        raise JoinCodeError("The join code is invalid or corrupted.") from exc
+
+
+def _decode_direct_join_code(raw: bytes) -> JoinTarget:
+    if len(raw) < 10:
+        raise JoinCodeError("The join code is too short.")
+
+    payload = raw[:-2]
+    expected_checksum = struct.unpack("!H", raw[-2:])[0]
+    actual_checksum = zlib.crc32(payload) & 0xFFFF
+    if expected_checksum != actual_checksum:
+        raise JoinCodeError("The join code checksum is invalid.")
+
+    family = payload[1]
+    try:
+        port = struct.unpack("!H", payload[2:4])[0]
+    except struct.error as exc:
+        raise JoinCodeError("The join code does not contain a valid signaling port.") from exc
+
+    if family == 0x04:
+        host_end = 8
+        if len(payload) != 11:
+            raise JoinCodeError("The join code payload is malformed.")
+        host = socket.inet_ntop(socket.AF_INET, payload[4:host_end])
+    elif family == 0x06:
+        host_end = 20
+        if len(payload) != 23:
+            raise JoinCodeError("The join code payload is malformed.")
+        host = socket.inet_ntop(socket.AF_INET6, payload[4:host_end])
+    else:
+        raise JoinCodeError("The join code address family is not supported.")
+
+    pin = f"{int.from_bytes(payload[host_end:host_end + 3], byteorder='big'):06d}"
+    if not host or port <= 0 or port > 65535:
+        raise JoinCodeError("The join code does not contain a complete session target.")
+    return JoinTarget(mode="direct", host=host, port=port, pin=pin)
+
+
+def _decode_structured_join_code(raw: bytes) -> JoinTarget:
+    payload = raw[:-2]
+    expected_checksum = struct.unpack("!H", raw[-2:])[0]
+    actual_checksum = zlib.crc32(payload) & 0xFFFF
+    if expected_checksum != actual_checksum:
+        raise JoinCodeError("The join code checksum is invalid.")
+
+    try:
+        payload_data = json.loads(zlib.decompress(payload[1:]).decode("utf-8"))
+    except Exception as exc:
+        raise JoinCodeError("The join code payload is malformed.") from exc
+
+    mode = str(payload_data.get("m", "")).strip().lower()
+    pin = str(payload_data.get("p", "")).strip()
+    if len(pin) != 6 or not pin.isdigit():
+        raise JoinCodeError("The join code is missing a valid session PIN.")
+
+    if mode == "relay":
+        relay_url = str(payload_data.get("u", "")).strip().rstrip("/")
+        session_id = str(payload_data.get("s", "")).strip().upper()
+        if not relay_url or not session_id:
+            raise JoinCodeError("The relay join code is incomplete.")
+        return JoinTarget(
+            mode="relay",
+            relay_url=relay_url,
+            session_id=session_id,
+            pin=pin,
+        )
+    raise JoinCodeError("The join code mode is not supported by this app.")
 
 
 def _parse_stun_response(response: bytes, transaction_id: bytes) -> str | None:

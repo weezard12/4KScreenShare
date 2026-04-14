@@ -7,7 +7,7 @@ Cross-platform Python desktop app for peer-to-peer screen sharing with audio. Th
 - `HOST`: share one monitor with optional system audio and microphone
 - `JOIN`: connect by internet join code, or by host IP address and 6-digit session PIN
 
-The project uses `CustomTkinter` for the GUI, `mss` for screen capture, `sounddevice` for audio, `aiortc` for WebRTC transport, and a minimal TCP JSON signaling exchange for SDP offer/answer flow.
+The project uses `CustomTkinter` for the GUI, `mss` for screen capture, `sounddevice` for audio, `aiortc` for WebRTC transport, direct TCP signaling for LAN/manual-forwarded sessions, and an optional public relay for internet sessions.
 
 ## Project Layout
 
@@ -74,6 +74,20 @@ export SCREENSHARE_TURN_USERNAME="your-username"
 export SCREENSHARE_TURN_CREDENTIAL="your-password"
 ```
 
+5. Optional but recommended for internet sessions without manual router forwarding: configure a public signaling relay URL.
+
+Windows PowerShell:
+
+```powershell
+$env:SCREENSHARE_SIGNALING_RELAY_URL="https://your-relay.example.com"
+```
+
+macOS / Linux:
+
+```bash
+export SCREENSHARE_SIGNALING_RELAY_URL="https://your-relay.example.com"
+```
+
 ## FFmpeg Install By OS
 
 ### Windows
@@ -128,7 +142,7 @@ The launch screen presents the two modes.
 2. Pick the monitor, resolution, FPS, quality preset, and video encoder format (`H.264` or `H.265`).
 3. Enable `Share system audio` and/or `Share microphone` if needed.
 4. Click `Start Sharing`.
-5. Share the `Internet Join Code` for internet sessions, or the local IP and 6-digit PIN for LAN sessions.
+5. Share the `Internet Join Code` for internet sessions when the host shows it as ready, or share the local/public IP and 6-digit PIN for direct sessions.
 6. Click `Stop Sharing` to end the session cleanly.
 
 ## Join Mode
@@ -143,9 +157,11 @@ The launch screen presents the two modes.
 
 - WebRTC is configured with Google STUN by default: `stun:stun.l.google.com:19302`.
 - If `SCREENSHARE_TURN_URLS` is set, the app adds TURN relay servers to the ICE configuration for better cross-network reliability.
-- The signaling server listens on TCP port `8765` on the host machine.
-- The host now generates an `Internet Join Code`. The client decodes that code into the host signaling endpoint and session PIN, then WebRTC negotiates the real media path over ICE.
-- For direct internet sharing, the host's signaling port still needs to be reachable from the public internet. If viewers cannot connect, forward TCP `8765` on the router or place the host behind a public signaling/rendezvous service.
+- The direct signaling server listens on TCP port `8765` on the host machine.
+- The host now generates an `Internet Join Code` only when the internet signaling path is actually prepared.
+- If `SCREENSHARE_SIGNALING_RELAY_URL` is set, the host and viewer use that public relay for the offer/answer exchange, so internet sessions no longer depend on inbound TCP to the host.
+- If no relay URL is configured, the host tries to open a UPnP router mapping for TCP `8765`. When that succeeds, the internet join code resolves to the public IP and mapped port automatically.
+- If neither relay signaling nor automatic router mapping is available, the app tells the user that internet joining is not ready instead of showing a misleading public code that will fail.
 - The packaged Windows app now carries its own `ffmpeg.exe` via `imageio-ffmpeg`, so NVENC does not depend on a separate FFmpeg install.
 - The Windows one-file build now shows an immediate splash screen while the bundled runtime extracts and the main UI initializes.
 - If FFmpeg is missing entirely, startup now offers an install popup and uses WinGet, Homebrew, or the detected Linux package manager when available.
@@ -165,6 +181,30 @@ The launch screen presents the two modes.
 - If the machine cannot sustain 4K capture, the host auto-downscales to 1080p and shows a non-blocking toast.
 - The current `aiortc` / PyAV H.264 runtime is reliable through `1080p`. Requests above `1080p` are automatically downgraded to `1080p` with a toast so the session stays usable instead of connecting to a black screen.
 - STUN-only media works for many public-network cases, but TURN is the reliable fallback when both sides are behind restrictive NATs or firewalls.
+
+## Public Relay Server
+
+If you want robust internet sessions without relying on router forwarding, run the included signaling relay on any public machine:
+
+```bash
+python -m screenshare.network.relay_server --host 0.0.0.0 --port 8080
+```
+
+Then point both the host and the viewer at that relay before launching the app:
+
+Windows PowerShell:
+
+```powershell
+$env:SCREENSHARE_SIGNALING_RELAY_URL="https://your-relay.example.com"
+```
+
+macOS / Linux:
+
+```bash
+export SCREENSHARE_SIGNALING_RELAY_URL="https://your-relay.example.com"
+```
+
+The join code then resolves to the relay session, while WebRTC still negotiates the actual media route over ICE.
 
 ## Keyboard Shortcuts
 

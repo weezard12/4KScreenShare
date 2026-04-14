@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+import secrets
 import socket
 from dataclasses import dataclass, field
 
@@ -13,6 +14,7 @@ STUN_SERVER_URLS = ["stun:stun.l.google.com:19302"]
 TURN_URLS_ENV = "SCREENSHARE_TURN_URLS"
 TURN_USERNAME_ENV = "SCREENSHARE_TURN_USERNAME"
 TURN_CREDENTIAL_ENV = "SCREENSHARE_TURN_CREDENTIAL"
+SIGNALING_RELAY_URL_ENV = "SCREENSHARE_SIGNALING_RELAY_URL"
 
 QUALITY_PRESETS = ("High", "Balanced", "Low-latency")
 FPS_PRESETS = (60, 30, 15)
@@ -23,6 +25,7 @@ VIDEO_CODEC_PRESETS = VIDEO_CODEC_LABELS
 class HostSessionConfig:
     pin: str
     host_ip: str
+    relay_session_id: str
     monitor_index: int
     monitor_label: str
     monitor_region: dict[str, int]
@@ -59,6 +62,11 @@ def generate_session_pin() -> str:
     return f"{random.randint(0, 999999):06d}"
 
 
+def generate_public_session_id(length: int = 12) -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
 def detect_local_ip() -> str:
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -68,6 +76,13 @@ def detect_local_ip() -> str:
         return "127.0.0.1"
     finally:
         probe.close()
+
+
+def configured_signaling_relay_url() -> str | None:
+    value = os.getenv(SIGNALING_RELAY_URL_ENV, "").strip()
+    if not value:
+        return None
+    return value.rstrip("/")
 
 
 def ice_server_settings() -> list[dict[str, object]]:

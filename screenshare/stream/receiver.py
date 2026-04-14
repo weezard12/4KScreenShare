@@ -18,7 +18,7 @@ from screenshare.network.session import (
     ice_server_settings,
     quality_from_latency,
 )
-from screenshare.network.signaling import JoinSignalingClient
+from screenshare.network.signaling import JoinSignalingClient, RelayJoinSignalingClient
 from screenshare.stream.video_codecs import (
     ensure_webrtc_video_codecs_registered,
     preferred_video_capabilities,
@@ -71,6 +71,8 @@ class ViewerClient:
         self.host = ""
         self.pin = ""
         self.port = DEFAULT_SIGNALING_PORT
+        self.relay_url: str | None = None
+        self.relay_session_id: str | None = None
 
         self._pc: RTCPeerConnection | None = None
         self._stats_task: asyncio.Task[None] | None = None
@@ -84,10 +86,20 @@ class ViewerClient:
         self._manual_stop = False
         self._connect_lock = asyncio.Lock()
 
-    async def connect(self, host: str, pin: str, port: int = DEFAULT_SIGNALING_PORT) -> None:
+    async def connect(
+        self,
+        host: str,
+        pin: str,
+        port: int = DEFAULT_SIGNALING_PORT,
+        *,
+        relay_url: str | None = None,
+        relay_session_id: str | None = None,
+    ) -> None:
         self.host = host
         self.pin = pin.strip()
         self.port = port
+        self.relay_url = relay_url.rstrip("/") if relay_url else None
+        self.relay_session_id = relay_session_id.strip().upper() if relay_session_id else None
         self._manual_stop = False
         self._reconnect_policy.reset()
         await self._connect_once(initial=True)
@@ -149,7 +161,10 @@ class ViewerClient:
             await pc.setLocalDescription(offer)
             await wait_for_ice_complete(pc)
 
-            client = JoinSignalingClient(self.host, self.port, self.pin)
+            if self.relay_url and self.relay_session_id:
+                client = RelayJoinSignalingClient(self.relay_url, self.relay_session_id, self.pin)
+            else:
+                client = JoinSignalingClient(self.host, self.port, self.pin)
             try:
                 answer = await client.exchange_offer(
                     {

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import os
 import sys
 import threading
+import time
 import tkinter.messagebox as messagebox
 from typing import Any, Coroutine
 
@@ -45,6 +47,8 @@ class AsyncRuntime:
             daemon=True,
         )
         self._started = threading.Event()
+        self._stop_lock = threading.Lock()
+        self._stopped = False
 
     @property
     def loop(self) -> asyncio.AbstractEventLoop:
@@ -57,9 +61,15 @@ class AsyncRuntime:
     def submit(self, coro: Coroutine[Any, Any, Any]) -> concurrent.futures.Future[Any]:
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
-    def stop(self) -> None:
+    def stop(self, *, timeout: float = 2.5) -> None:
+        with self._stop_lock:
+            if self._stopped:
+                self._thread.join(timeout=1.5)
+                return
+            self._stopped = True
+
         if self._loop.is_closed():
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=1.5)
             return
 
         async def _shutdown() -> None:
@@ -74,11 +84,11 @@ class AsyncRuntime:
         if self._loop.is_running():
             future = asyncio.run_coroutine_threadsafe(_shutdown(), self._loop)
             try:
-                future.result(timeout=10)
+                future.result(timeout=timeout)
             except concurrent.futures.TimeoutError:
                 if not self._loop.is_closed():
                     self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join(timeout=5)
+        self._thread.join(timeout=timeout + 1.0)
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
@@ -103,6 +113,11 @@ class ScreenShareApp(ctk.CTk):
         self._active_view: ctk.CTkFrame | None = None
         self._ffmpeg_status: FfmpegStatus | None = None
         self._ffmpeg_setup_window: ctk.CTkToplevel | None = None
+        self._quitting = False
+        self._closing_overlay: ctk.CTkFrame | None = None
+        self._closing_progress: ctk.CTkProgressBar | None = None
+        self._shutdown_done = threading.Event()
+        self._quit_started_at = 0.0
 
         self.protocol("WM_DELETE_WINDOW", self.quit_app)
         self.bind_all("<Control-q>", lambda _event: self.quit_app())
@@ -149,8 +164,14 @@ class ScreenShareApp(ctk.CTk):
         messagebox.showerror(title, message, parent=self)
 
     def quit_app(self) -> None:
-        if self._ffmpeg_setup_window is not None and self._ffmpeg_setup_window.winfo_exists():
-            self._ffmpeg_setup_window.destroy()
+        if self._quitting:
+            return
+        self._quitting = True
+        self._shutdown_done.clear()
+        self._quit_started_at = time.perf_counter()
+
+        self._close_ffmpeg_setup_progress()
+        self._show_closing_overlay()
 
         if self._active_view is not None and hasattr(self._active_view, "cleanup"):
             try:
@@ -158,12 +179,19 @@ class ScreenShareApp(ctk.CTk):
             except Exception:
                 pass
 
-        try:
-            self.runtime.stop()
-        except Exception:
-            pass
-
-        self.destroy()
+        worker = threading.Thread(
+            target=self._shutdown_worker,
+            name="screenshare-shutdown",
+            daemon=True,
+        )
+        worker.start()
+        force_worker = threading.Thread(
+            target=self._force_exit_worker,
+            name="screenshare-force-exit",
+            daemon=True,
+        )
+        force_worker.start()
+        self.after(40, self._poll_shutdown_complete)
 
     def _swap_view(self, view: ctk.CTkFrame) -> None:
         if self._active_view is not None:
@@ -174,6 +202,81 @@ class ScreenShareApp(ctk.CTk):
 
         self._active_view = view
         self._active_view.pack(fill="both", expand=True)
+
+    def _show_closing_overlay(self) -> None:
+        if self._closing_overlay is not None and self._closing_overlay.winfo_exists():
+            return
+
+        self.update_idletasks()
+        overlay = ctk.CTkFrame(self, corner_radius=0, fg_color=("#e8edf4", "#0a1017"))
+        overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        overlay.lift()
+        overlay.grid_columnconfigure(0, weight=1)
+        overlay.grid_rowconfigure(0, weight=1)
+
+        shell = ctk.CTkFrame(overlay, width=420, height=190, corner_radius=24, fg_color="#10283d")
+        shell.place(relx=0.5, rely=0.5, anchor="center")
+        shell.pack_propagate(False)
+
+        ctk.CTkLabel(
+            shell,
+            text="Closing App",
+            font=ctk.CTkFont(size=28, weight="bold"),
+        ).pack(anchor="w", padx=24, pady=(24, 8))
+        ctk.CTkLabel(
+            shell,
+            text="Stopping the streaming session and background tasks.",
+            text_color="#c7d5e0",
+            justify="left",
+            wraplength=360,
+        ).pack(anchor="w", padx=24)
+
+        progress = ctk.CTkProgressBar(shell, mode="indeterminate")
+        progress.pack(fill="x", padx=24, pady=(20, 8))
+        progress.start()
+
+        ctk.CTkLabel(
+            shell,
+            text="The window will close automatically.",
+            text_color="#9aa6b2",
+        ).pack(anchor="w", padx=24, pady=(0, 22))
+
+        self._closing_overlay = overlay
+        self._closing_progress = progress
+
+    def _shutdown_worker(self) -> None:
+        try:
+            self.runtime.stop(timeout=2.0)
+        except Exception:
+            pass
+        self._shutdown_done.set()
+
+    def _poll_shutdown_complete(self) -> None:
+        if not self._quitting:
+            return
+        elapsed = time.perf_counter() - self._quit_started_at
+        if self._shutdown_done.is_set() and elapsed >= 0.15:
+            self._finish_quit()
+            return
+        if elapsed >= 1.5:
+            self._finish_quit()
+            return
+        self.after(40, self._poll_shutdown_complete)
+
+    def _force_exit_worker(self) -> None:
+        time.sleep(3.0)
+        if self._quitting:
+            os._exit(0)
+
+    def _finish_quit(self) -> None:
+        if self._closing_progress is not None:
+            with suppress(Exception):
+                self._closing_progress.stop()
+            self._closing_progress = None
+        if self._closing_overlay is not None and self._closing_overlay.winfo_exists():
+            self._closing_overlay.destroy()
+        self._closing_overlay = None
+        self.destroy()
 
     def _maybe_prompt_ffmpeg_setup(self) -> None:
         self._ffmpeg_status = probe_ffmpeg_status()
