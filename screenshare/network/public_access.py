@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import ipaddress
 import json
 import os
 import socket
@@ -188,6 +190,23 @@ def resolve_direct_join_info(
             None,
         )
 
+    if not is_publicly_routable_address(public_host):
+        return (
+            PublicJoinInfo(
+                ready=False,
+                mode="direct",
+                join_code=None,
+                summary="Internet join needs an outbound relay",
+                detail=(
+                    "The detected external address is not globally routable. "
+                    "This usually means the host is behind carrier-grade NAT or another shared edge, "
+                    "so direct internet joins cannot work reliably without a public relay."
+                ),
+                endpoint_text=f"Shared-edge address detected  {public_host}",
+            ),
+            None,
+        )
+
     lease = try_add_tcp_port_mapping(
         internal_client=internal_host_ip,
         internal_port=signaling_port,
@@ -216,6 +235,23 @@ def resolve_direct_join_info(
         )
 
     external_host = lease.external_ip or public_host
+    if not is_publicly_routable_address(external_host):
+        with contextlib.suppress(Exception):
+            lease.release()
+        return (
+            PublicJoinInfo(
+                ready=False,
+                mode="direct",
+                join_code=None,
+                summary="Internet join needs an outbound relay",
+                detail=(
+                    "The router mapping resolved to a non-public address, so viewers on the public internet still "
+                    "cannot reach the host directly. Use the automatic relay or configure a real public relay."
+                ),
+                endpoint_text=f"Shared-edge address detected  {external_host}",
+            ),
+            None,
+        )
     join_code = encode_join_code(external_host, lease.external_port, pin)
     relay_note = (
         "TURN is configured for restrictive NATs."
@@ -233,6 +269,13 @@ def resolve_direct_join_info(
         ),
         lease,
     )
+
+
+def is_publicly_routable_address(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_global
+    except ValueError:
+        return False
 
 
 def _base32_join_code(raw: bytes) -> str:

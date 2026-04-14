@@ -37,7 +37,8 @@ from screenshare.network.session import (
     ice_server_settings,
     parse_bitrate_to_kbps,
 )
-from screenshare.network.signaling import HostSignalingServer, RelayHostSignalingClient
+from screenshare.network.quick_tunnel import QuickTunnelProcess
+from screenshare.network.signaling import EmbeddedRelayServer, HostSignalingServer, RelayHostSignalingClient
 from screenshare.network.upnp import PortMappingLease
 from screenshare.stream.encoder import (
     apply_runtime_video_profile,
@@ -571,6 +572,12 @@ class HostStreamer:
         self.encoder = detect_best_encoder_for_format(config.video_codec)
         self.quality_profile = resolve_quality_profile(config.resolution_label, config.quality)
         self.relay_url = configured_signaling_relay_url()
+        self._relay_host_url: str | None = self.relay_url
+        self._relay_join_url: str | None = self.relay_url
+        self._embedded_relay: EmbeddedRelayServer | None = None
+        self._quick_tunnel: QuickTunnelProcess | None = None
+        self._quick_tunnel_task: asyncio.Task[str] | None = None
+        self._quick_tunnel_error: str | None = None
         self._public_join_info: PublicJoinInfo | None = None
         self._port_mapping: PortMappingLease | None = None
         self._use_ffmpeg_packet_pipeline = False
@@ -711,6 +718,31 @@ class HostStreamer:
                 self._safe_emit_toast(
                     "Internet relay signaling is still connecting. LAN viewers can join immediately."
                 )
+        else:
+            try:
+                self._embedded_relay = EmbeddedRelayServer()
+                self._relay_host_url = await self._embedded_relay.start()
+                self.relay_signaling = RelayHostSignalingClient(
+                    self._relay_host_url,
+                    self.config.relay_session_id,
+                    self.config.pin,
+                    self._handle_offer,
+                    on_status=self._safe_emit_toast,
+                )
+                relay_connected = await self.relay_signaling.start()
+                if relay_connected:
+                    self._safe_emit_toast("Preparing an outbound public relay for internet viewers...")
+                else:
+                    self._safe_emit_toast("Preparing the local relay before publishing an internet join code...")
+                self._quick_tunnel = QuickTunnelProcess(on_status=self._safe_emit_toast)
+                self._quick_tunnel_task = asyncio.create_task(
+                    asyncio.to_thread(self._quick_tunnel.start, self._relay_host_url)
+                )
+            except Exception as exc:
+                self._quick_tunnel_error = str(exc)
+                self._safe_emit_toast(
+                    f"Automatic public relay setup failed. Falling back to direct internet detection: {exc}"
+                )
         self._safe_emit_toast(f"Encoder selected: {self.encoder.display_name}")
 
         self._stats_task = asyncio.create_task(self._stats_loop())
@@ -732,6 +764,21 @@ class HostStreamer:
         if self.relay_signaling is not None:
             await self.relay_signaling.stop()
             self.relay_signaling = None
+        if self._quick_tunnel_task is not None:
+            self._quick_tunnel_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._quick_tunnel_task
+            self._quick_tunnel_task = None
+        if self._quick_tunnel is not None:
+            with suppress(Exception):
+                await asyncio.to_thread(self._quick_tunnel.stop)
+            self._quick_tunnel = None
+        if self._embedded_relay is not None:
+            await self._embedded_relay.stop()
+            self._embedded_relay = None
+        self._relay_host_url = self.relay_url
+        self._relay_join_url = self.relay_url
+        self._quick_tunnel_error = None
         if self._port_mapping is not None:
             lease = self._port_mapping
             self._port_mapping = None
@@ -778,7 +825,50 @@ class HostStreamer:
             )
             return self._public_join_info
 
+        if self._quick_tunnel_task is not None and self._quick_tunnel_task.done():
+            try:
+                self._relay_join_url = self._quick_tunnel_task.result().rstrip("/")
+                self._quick_tunnel_error = None
+            except asyncio.CancelledError:
+                self._quick_tunnel_error = "Automatic public relay setup was cancelled."
+            except Exception as exc:
+                self._quick_tunnel_error = str(exc)
+            finally:
+                self._quick_tunnel_task = None
+
+        if self._relay_join_url:
+            self._public_join_info = resolve_relay_join_info(
+                relay_url=self._relay_join_url,
+                session_id=self.config.relay_session_id,
+                pin=self.config.pin,
+                relay_connected=self.relay_signaling.is_connected if self.relay_signaling else False,
+            )
+            return self._public_join_info
+
+        if self._quick_tunnel_task is not None:
+            return PublicJoinInfo(
+                ready=False,
+                mode="relay",
+                join_code=None,
+                summary="Preparing internet join code",
+                detail=(
+                    "The host is publishing an outbound signaling relay. "
+                    "This avoids port forwarding and works on CGNAT networks once the public URL is ready."
+                ),
+                endpoint_text="Preparing outbound public endpoint",
+            )
+
         if self._public_join_info is not None:
+            if self._quick_tunnel_error:
+                detail = f"{self._public_join_info.detail} Automatic relay setup failed: {self._quick_tunnel_error}"
+                return PublicJoinInfo(
+                    ready=self._public_join_info.ready,
+                    mode=self._public_join_info.mode,
+                    join_code=self._public_join_info.join_code,
+                    summary=self._public_join_info.summary,
+                    detail=detail,
+                    endpoint_text=self._public_join_info.endpoint_text,
+                )
             return self._public_join_info
 
         info, lease = await asyncio.to_thread(
@@ -788,6 +878,15 @@ class HostStreamer:
             pin=self.config.pin,
             turn_enabled=len(ice_server_settings()) > 1,
         )
+        if self._quick_tunnel_error:
+            info = PublicJoinInfo(
+                ready=info.ready,
+                mode=info.mode,
+                join_code=info.join_code,
+                summary=info.summary,
+                detail=f"{info.detail} Automatic relay setup failed: {self._quick_tunnel_error}",
+                endpoint_text=info.endpoint_text,
+            )
         self._public_join_info = info
         if lease is not None:
             self._port_mapping = lease

@@ -15,6 +15,14 @@ TURN_URLS_ENV = "SCREENSHARE_TURN_URLS"
 TURN_USERNAME_ENV = "SCREENSHARE_TURN_USERNAME"
 TURN_CREDENTIAL_ENV = "SCREENSHARE_TURN_CREDENTIAL"
 SIGNALING_RELAY_URL_ENV = "SCREENSHARE_SIGNALING_RELAY_URL"
+DISABLE_PUBLIC_TURN_FALLBACK_ENV = "SCREENSHARE_DISABLE_PUBLIC_TURN_FALLBACK"
+DEFAULT_PUBLIC_TURN_URLS = [
+    "turn:openrelay.metered.ca:80",
+    "turn:openrelay.metered.ca:443",
+    "turn:openrelay.metered.ca:443?transport=tcp",
+]
+DEFAULT_PUBLIC_TURN_USERNAME = "openrelayproject"
+DEFAULT_PUBLIC_TURN_CREDENTIAL = "openrelayproject"
 
 QUALITY_PRESETS = ("High", "Balanced", "Low-latency")
 FPS_PRESETS = (60, 30, 15)
@@ -88,22 +96,35 @@ def configured_signaling_relay_url() -> str | None:
 def ice_server_settings() -> list[dict[str, object]]:
     settings: list[dict[str, object]] = [{"urls": list(STUN_SERVER_URLS)}]
     turn_urls = [value.strip() for value in os.getenv(TURN_URLS_ENV, "").split(",") if value.strip()]
-    if not turn_urls:
+    if turn_urls:
+        turn_server: dict[str, object] = {"urls": turn_urls}
+        username = os.getenv(TURN_USERNAME_ENV, "").strip()
+        credential = os.getenv(TURN_CREDENTIAL_ENV, "").strip()
+        if username:
+            turn_server["username"] = username
+        if credential:
+            turn_server["credential"] = credential
+        settings.append(turn_server)
         return settings
 
-    turn_server: dict[str, object] = {"urls": turn_urls}
-    username = os.getenv(TURN_USERNAME_ENV, "").strip()
-    credential = os.getenv(TURN_CREDENTIAL_ENV, "").strip()
-    if username:
-        turn_server["username"] = username
-    if credential:
-        turn_server["credential"] = credential
-    settings.append(turn_server)
+    if _default_public_turn_enabled():
+        settings.append(
+            {
+                "urls": list(DEFAULT_PUBLIC_TURN_URLS),
+                "username": DEFAULT_PUBLIC_TURN_USERNAME,
+                "credential": DEFAULT_PUBLIC_TURN_CREDENTIAL,
+            }
+        )
     return settings
 
 
 def has_turn_server_config() -> bool:
     return len(ice_server_settings()) > 1
+
+
+def _default_public_turn_enabled() -> bool:
+    value = os.getenv(DISABLE_PUBLIC_TURN_FALLBACK_ENV, "").strip().lower()
+    return value not in {"1", "true", "yes", "on"}
 
 
 def format_bitrate(bits_per_second: float) -> str:

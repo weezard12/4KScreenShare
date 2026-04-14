@@ -7,7 +7,7 @@ Cross-platform Python desktop app for peer-to-peer screen sharing with audio. Th
 - `HOST`: share one monitor with optional system audio and microphone
 - `JOIN`: connect by internet join code, or by host IP address and 6-digit session PIN
 
-The project uses `CustomTkinter` for the GUI, `mss` for screen capture, `sounddevice` for audio, `aiortc` for WebRTC transport, direct TCP signaling for LAN/manual-forwarded sessions, and an optional public relay for internet sessions.
+The project uses `CustomTkinter` for the GUI, `mss` for screen capture, `sounddevice` for audio, `aiortc` for WebRTC transport, direct TCP signaling for LAN/manual-forwarded sessions, and an automatic outbound signaling relay path for internet sessions.
 
 ## Project Layout
 
@@ -56,7 +56,7 @@ ffmpeg -version
 
 If FFmpeg is unavailable, the app now offers an automatic setup popup at startup when it can use the platform package manager.
 
-4. Optional but recommended for reliable internet-wide sessions: configure a TURN server in your shell before launching the app.
+4. Optional: override the built-in public TURN fallback with your own TURN service before launching the app.
 
 Windows PowerShell:
 
@@ -74,7 +74,7 @@ export SCREENSHARE_TURN_USERNAME="your-username"
 export SCREENSHARE_TURN_CREDENTIAL="your-password"
 ```
 
-5. Optional but recommended for internet sessions without manual router forwarding: configure a public signaling relay URL.
+5. Optional: provide your own public signaling relay URL. If you do not set one, the host now tries to publish an outbound public relay automatically.
 
 Windows PowerShell:
 
@@ -142,7 +142,7 @@ The launch screen presents the two modes.
 2. Pick the monitor, resolution, FPS, quality preset, and video encoder format (`H.264` or `H.265`).
 3. Enable `Share system audio` and/or `Share microphone` if needed.
 4. Click `Start Sharing`.
-5. Share the `Internet Join Code` for internet sessions when the host shows it as ready, or share the local/public IP and 6-digit PIN for direct sessions.
+5. Share the `Internet Join Code` for internet sessions when the host shows it as ready, or share the local IP and 6-digit PIN for LAN sessions.
 6. Click `Stop Sharing` to end the session cleanly.
 
 ## Join Mode
@@ -156,13 +156,16 @@ The launch screen presents the two modes.
 ## Notes
 
 - WebRTC is configured with Google STUN by default: `stun:stun.l.google.com:19302`.
-- If `SCREENSHARE_TURN_URLS` is set, the app adds TURN relay servers to the ICE configuration for better cross-network reliability.
+- If `SCREENSHARE_TURN_URLS` is set, the app adds your TURN relay servers to the ICE configuration.
+- If `SCREENSHARE_TURN_URLS` is not set, the app falls back to a public TURN configuration so cross-network sessions still have a relay path for restrictive NATs. Set `SCREENSHARE_DISABLE_PUBLIC_TURN_FALLBACK=1` if you want to disable that fallback.
 - The direct signaling server listens on TCP port `8765` on the host machine.
 - The host now generates an `Internet Join Code` only when the internet signaling path is actually prepared.
-- If `SCREENSHARE_SIGNALING_RELAY_URL` is set, the host and viewer use that public relay for the offer/answer exchange, so internet sessions no longer depend on inbound TCP to the host.
-- If no relay URL is configured, the host tries to open a UPnP router mapping for TCP `8765`. When that succeeds, the internet join code resolves to the public IP and mapped port automatically.
-- If neither relay signaling nor automatic router mapping is available, the app tells the user that internet joining is not ready instead of showing a misleading public code that will fail.
+- If `SCREENSHARE_SIGNALING_RELAY_URL` is set, the host and viewer use that public relay for the offer/answer exchange.
+- If no relay URL is configured, the host starts an embedded localhost signaling relay and publishes it through an outbound Cloudflare Tunnel path when available, so internet sessions do not require inbound TCP to the host.
+- If the automatic outbound relay cannot be prepared, the host falls back to direct UPnP router mapping for TCP `8765`.
+- The app now refuses to publish a direct internet join code for non-global addresses such as CGNAT `100.64.0.0/10`, because those addresses are not publicly reachable.
 - The packaged Windows app now carries its own `ffmpeg.exe` via `imageio-ffmpeg`, so NVENC does not depend on a separate FFmpeg install.
+- On Windows, the app automatically downloads `cloudflared.exe` into `%LOCALAPPDATA%\\4KScreenShare\\tools` the first time it needs the outbound relay path.
 - The Windows one-file build now shows an immediate splash screen while the bundled runtime extracts and the main UI initializes.
 - If FFmpeg is missing entirely, startup now offers an install popup and uses WinGet, Homebrew, or the detected Linux package manager when available.
 - On Windows and Linux, the host probes for NVIDIA GPUs and uses a bundled FFmpeg NVENC packet pipeline automatically when available.
@@ -184,7 +187,7 @@ The launch screen presents the two modes.
 
 ## Public Relay Server
 
-If you want robust internet sessions without relying on router forwarding, run the included signaling relay on any public machine:
+If you want production-grade internet sessions without relying on router forwarding or Cloudflare Quick Tunnels, run the included signaling relay on any public machine:
 
 ```bash
 python -m screenshare.network.relay_server --host 0.0.0.0 --port 8080
@@ -204,7 +207,7 @@ macOS / Linux:
 export SCREENSHARE_SIGNALING_RELAY_URL="https://your-relay.example.com"
 ```
 
-The join code then resolves to the relay session, while WebRTC still negotiates the actual media route over ICE.
+The join code then resolves to the relay session, while WebRTC still negotiates the actual media route over ICE. This is the preferred production path. Cloudflare Quick Tunnels are convenient for testing, but Cloudflare documents them as intended for testing and development only.
 
 ## Keyboard Shortcuts
 

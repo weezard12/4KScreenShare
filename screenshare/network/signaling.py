@@ -260,6 +260,47 @@ class RelayJoinSignalingClient:
         return body["answer"]
 
 
+class EmbeddedRelayServer:
+    def __init__(self) -> None:
+        self._app = create_relay_app()
+        self._runner: web.AppRunner | None = None
+        self._site: web.BaseSite | None = None
+        self._port: int | None = None
+
+    @property
+    def base_url(self) -> str:
+        if self._port is None:
+            raise SignalingError("The embedded relay has not started yet.")
+        return f"http://127.0.0.1:{self._port}"
+
+    async def start(self) -> str:
+        if self._runner is not None:
+            return self.base_url
+
+        self._runner = web.AppRunner(self._app, access_log=None)
+        await self._runner.setup()
+        self._site = web.TCPSite(self._runner, host="127.0.0.1", port=0)
+        await self._site.start()
+        server = getattr(self._site, "_server", None)
+        sockets = getattr(server, "sockets", None) or []
+        if not sockets:
+            await self.stop()
+            raise SignalingError("The embedded relay did not expose a listening socket.")
+        self._port = int(sockets[0].getsockname()[1])
+        return self.base_url
+
+    async def stop(self) -> None:
+        if self._site is not None:
+            with suppress(Exception):
+                await self._site.stop()
+            self._site = None
+        if self._runner is not None:
+            with suppress(Exception):
+                await self._runner.cleanup()
+            self._runner = None
+        self._port = None
+
+
 @dataclass(slots=True)
 class _RelayHostChannel:
     websocket: web.WebSocketResponse
