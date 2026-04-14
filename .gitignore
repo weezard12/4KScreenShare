@@ -1,0 +1,10 @@
+.venv-build/
+.uv-cache/
+build/
+dist/
+.idea/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
