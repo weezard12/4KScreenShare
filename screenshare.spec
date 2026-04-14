@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 
+from PyInstaller.building.splash import Splash
 from PyInstaller.utils.hooks import collect_all
 
 
@@ -73,8 +74,20 @@ a = Analysis(
     noarchive=False,
 )
 pyz = PYZ(a.pure)
+splash = Splash(
+    str(project_root / "assets" / "splash.png"),
+    binaries=a.binaries,
+    datas=a.datas,
+    text_pos=(92, 388),
+    text_size=14,
+    text_color="#dbe8f4",
+    text_default="Launching 4K Screen Share...",
+    always_on_top=True,
+)
 exe = EXE(
     pyz,
+    splash,
+    splash.binaries,
     a.scripts,
     a.binaries,
     a.datas,
@@ -84,6 +97,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
+    icon=str(project_root / "assets" / "app_icon.ico"),
     console=False,
     disable_windowed_traceback=True,
 )

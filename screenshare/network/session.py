@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import os
 import random
 import socket
 from dataclasses import dataclass, field
 
+from screenshare.stream.video_codecs import VIDEO_CODEC_H264, VIDEO_CODEC_LABELS
+
 
 DEFAULT_SIGNALING_PORT = 8765
 STUN_SERVER_URLS = ["stun:stun.l.google.com:19302"]
+TURN_URLS_ENV = "SCREENSHARE_TURN_URLS"
+TURN_USERNAME_ENV = "SCREENSHARE_TURN_USERNAME"
+TURN_CREDENTIAL_ENV = "SCREENSHARE_TURN_CREDENTIAL"
 
 QUALITY_PRESETS = ("High", "Balanced", "Low-latency")
 FPS_PRESETS = (60, 30, 15)
+VIDEO_CODEC_PRESETS = VIDEO_CODEC_LABELS
 
 
 @dataclass(slots=True)
@@ -26,6 +33,7 @@ class HostSessionConfig:
     quality: str
     share_system_audio: bool
     share_microphone: bool
+    video_codec: str = VIDEO_CODEC_H264
     signaling_port: int = DEFAULT_SIGNALING_PORT
 
 
@@ -60,6 +68,27 @@ def detect_local_ip() -> str:
         return "127.0.0.1"
     finally:
         probe.close()
+
+
+def ice_server_settings() -> list[dict[str, object]]:
+    settings: list[dict[str, object]] = [{"urls": list(STUN_SERVER_URLS)}]
+    turn_urls = [value.strip() for value in os.getenv(TURN_URLS_ENV, "").split(",") if value.strip()]
+    if not turn_urls:
+        return settings
+
+    turn_server: dict[str, object] = {"urls": turn_urls}
+    username = os.getenv(TURN_USERNAME_ENV, "").strip()
+    credential = os.getenv(TURN_CREDENTIAL_ENV, "").strip()
+    if username:
+        turn_server["username"] = username
+    if credential:
+        turn_server["credential"] = credential
+    settings.append(turn_server)
+    return settings
+
+
+def has_turn_server_config() -> bool:
+    return len(ice_server_settings()) > 1
 
 
 def format_bitrate(bits_per_second: float) -> str:

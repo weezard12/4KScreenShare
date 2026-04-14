@@ -8,13 +8,22 @@ from aiortc import (
     RTCConfiguration,
     RTCIceServer,
     RTCPeerConnection,
-    RTCRtpSender,
     RTCSessionDescription,
 )
 
 from screenshare.capture.audio import AudioPlaybackBuffer
-from screenshare.network.session import DEFAULT_SIGNALING_PORT, ReconnectPolicy, STUN_SERVER_URLS, quality_from_latency
+from screenshare.network.session import (
+    DEFAULT_SIGNALING_PORT,
+    ReconnectPolicy,
+    ice_server_settings,
+    quality_from_latency,
+)
 from screenshare.network.signaling import JoinSignalingClient
+from screenshare.stream.video_codecs import (
+    ensure_webrtc_video_codecs_registered,
+    preferred_video_capabilities,
+    tune_video_receiver,
+)
 
 
 FrameCallback = Callable[[object], None]
@@ -57,6 +66,7 @@ class ViewerClient:
         self.on_stats = on_stats
         self.on_status = on_status
         self.on_error = on_error
+        ensure_webrtc_video_codecs_registered()
 
         self.host = ""
         self.pin = ""
@@ -101,10 +111,11 @@ class ViewerClient:
             await self._teardown(close_playback=False)
 
             pc = RTCPeerConnection(
-                RTCConfiguration(iceServers=[RTCIceServer(urls=STUN_SERVER_URLS)])
+                RTCConfiguration(iceServers=[RTCIceServer(**settings) for settings in ice_server_settings()])
             )
             self._pc = pc
             video_transceiver = pc.addTransceiver("video", direction="recvonly")
+            tune_video_receiver(video_transceiver.receiver)
             pc.addTransceiver("audio", direction="recvonly")
 
             @pc.on("connectionstatechange")
@@ -133,7 +144,7 @@ class ViewerClient:
                     self._playback.set_volume(self._volume)
                     self._audio_task = asyncio.create_task(self._consume_audio(track))
 
-            self._prefer_h264(video_transceiver)
+            self._prefer_video_codecs(video_transceiver)
             offer = await pc.createOffer()
             await pc.setLocalDescription(offer)
             await wait_for_ice_complete(pc)
@@ -279,14 +290,9 @@ class ViewerClient:
         if self.on_error is not None:
             self.on_error(message)
 
-    def _prefer_h264(self, transceiver: object) -> None:
+    def _prefer_video_codecs(self, transceiver: object) -> None:
         try:
-            capabilities = RTCRtpSender.getCapabilities("video")
-            preferred = [
-                codec
-                for codec in capabilities.codecs
-                if codec.mimeType.lower() == "video/h264"
-            ]
+            preferred = preferred_video_capabilities(["h265", "h264"])
             if not preferred:
                 return
             transceiver.setCodecPreferences(preferred)

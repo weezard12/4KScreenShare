@@ -10,7 +10,8 @@ from typing import Any
 import customtkinter as ctk
 from PIL import Image, ImageOps, ImageTk
 
-from screenshare.network.session import format_bitrate
+from screenshare.network.session import DEFAULT_SIGNALING_PORT, format_bitrate
+from screenshare.network.public_access import JoinCodeError, decode_join_code
 from screenshare.stream.receiver import ViewerClient
 
 
@@ -81,7 +82,7 @@ class ViewerView(ctk.CTkFrame):
         self._placeholder_id: int | None = None
         self._fullscreen = False
 
-        self.status_var = tk.StringVar(value="Enter the host IP and session PIN to connect.")
+        self.status_var = tk.StringVar(value="Enter an internet join code, or enter the host IP and session PIN.")
         self.latency_var = tk.StringVar(value="0 ms")
         self.bitrate_var = tk.StringVar(value="0 Mbps")
 
@@ -106,17 +107,19 @@ class ViewerView(ctk.CTkFrame):
     def _build_layout(self) -> None:
         header = ctk.CTkFrame(self, corner_radius=22)
         header.grid(row=0, column=0, padx=22, pady=(22, 14), sticky="ew")
-        header.grid_columnconfigure(3, weight=1)
+        header.grid_columnconfigure(4, weight=1)
 
         ctk.CTkButton(header, text="Back", width=90, command=self._go_back).grid(row=0, column=0, padx=(18, 10), pady=18)
 
+        self.join_code_entry = ctk.CTkEntry(header, width=260, placeholder_text="Internet Join Code")
+        self.join_code_entry.grid(row=0, column=1, padx=10, pady=18)
         self.host_entry = ctk.CTkEntry(header, width=220, placeholder_text="Host IP")
-        self.host_entry.grid(row=0, column=1, padx=10, pady=18)
+        self.host_entry.grid(row=0, column=2, padx=10, pady=18)
         self.host_entry.insert(0, "127.0.0.1")
         self.pin_entry = ctk.CTkEntry(header, width=150, placeholder_text="6-digit PIN")
-        self.pin_entry.grid(row=0, column=2, padx=10, pady=18)
+        self.pin_entry.grid(row=0, column=3, padx=10, pady=18)
 
-        ctk.CTkButton(header, text="Connect", width=110, command=self._connect).grid(row=0, column=3, padx=(10, 8), pady=18, sticky="e")
+        ctk.CTkButton(header, text="Connect", width=110, command=self._connect).grid(row=0, column=4, padx=(10, 8), pady=18, sticky="e")
         ctk.CTkButton(
             header,
             text="Disconnect",
@@ -124,9 +127,9 @@ class ViewerView(ctk.CTkFrame):
             fg_color="#8b1e3f",
             hover_color="#6d1631",
             command=self._disconnect,
-        ).grid(row=0, column=4, padx=(8, 8), pady=18)
+        ).grid(row=0, column=5, padx=(8, 8), pady=18)
         ctk.CTkButton(header, text="Fullscreen", width=110, command=self._toggle_fullscreen).grid(
-            row=0, column=5, padx=(8, 18), pady=18
+            row=0, column=6, padx=(8, 18), pady=18
         )
 
         body = ctk.CTkFrame(self, corner_radius=22)
@@ -173,10 +176,26 @@ class ViewerView(ctk.CTkFrame):
         )
 
     def _connect(self) -> None:
+        join_code = self.join_code_entry.get().strip()
         host = self.host_entry.get().strip()
         pin = self.pin_entry.get().strip()
-        if not host or not pin:
-            self.show_error("Missing fields", "Enter both the host IP address and session PIN.")
+        port = DEFAULT_SIGNALING_PORT
+
+        if join_code:
+            try:
+                target = decode_join_code(join_code)
+            except JoinCodeError as exc:
+                self.show_error("Invalid join code", str(exc))
+                return
+            host = target.host
+            pin = target.pin
+            port = target.port
+            self.host_entry.delete(0, "end")
+            self.host_entry.insert(0, host)
+            self.pin_entry.delete(0, "end")
+            self.pin_entry.insert(0, pin)
+        elif not host or not pin:
+            self.show_error("Missing fields", "Enter an internet join code, or enter both the host IP address and session PIN.")
             return
 
         if self._client is None:
@@ -188,8 +207,8 @@ class ViewerView(ctk.CTkFrame):
             )
             self._client.set_volume(self.volume_slider.get() / 100.0)
 
-        self.status_var.set("Connecting to host...")
-        future = self.runtime.submit(self._client.connect(host, pin))
+        self.status_var.set(f"Connecting to {host}:{port}...")
+        future = self.runtime.submit(self._client.connect(host, pin, port))
         future.add_done_callback(lambda done: _enqueue_latest(self._events, ("connect_done", done)))
 
     def _disconnect(self) -> None:

@@ -17,7 +17,6 @@ from aiortc import (
     RTCConfiguration,
     RTCIceServer,
     RTCPeerConnection,
-    RTCRtpSender,
     RTCSessionDescription,
     VideoStreamTrack,
 )
@@ -29,18 +28,20 @@ from screenshare.capture.audio import CompositeAudioTrack
 from screenshare.capture.screen import ScreenCaptureWorker
 from screenshare.network.session import (
     HostSessionConfig,
-    STUN_SERVER_URLS,
+    ice_server_settings,
     parse_bitrate_to_kbps,
 )
 from screenshare.network.signaling import HostSignalingServer
 from screenshare.stream.encoder import (
-    apply_aiortc_h264_profile,
+    apply_runtime_video_profile,
     build_ffmpeg_desktop_packet_command,
     build_ffmpeg_packet_command,
-    detect_best_encoder,
+    detect_best_encoder_for_format,
     ffmpeg_supports_filter,
     resolve_quality_profile,
 )
+from screenshare.stream.video_codecs import ensure_webrtc_video_codecs_registered, preferred_video_capabilities
+from screenshare.utils.process import hidden_subprocess_kwargs
 from screenshare.utils.resolution import scale_to_fit
 
 
@@ -192,8 +193,8 @@ class FFmpegPacketTrack(MediaStreamTrack):
 
     def _start_workers(self) -> None:
         self._worker_started = True
-        self._writer_thread = threading.Thread(target=self._writer_worker, name="ffmpeg-h264-writer", daemon=True)
-        self._reader_thread = threading.Thread(target=self._reader_worker, name="ffmpeg-h264-reader", daemon=True)
+        self._writer_thread = threading.Thread(target=self._writer_worker, name="ffmpeg-packet-writer", daemon=True)
+        self._reader_thread = threading.Thread(target=self._reader_worker, name="ffmpeg-packet-reader", daemon=True)
         self._writer_thread.start()
         self._reader_thread.start()
 
@@ -296,6 +297,7 @@ class FFmpegPacketTrack(MediaStreamTrack):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 bufsize=0,
+                **hidden_subprocess_kwargs(),
             )
             return self._process
 
@@ -355,6 +357,7 @@ class FFmpegDesktopCaptureTrack(MediaStreamTrack):
         height: int,
         fps: int,
         quality_profile,
+        include_cursor: bool = False,
         on_message: TextCallback | None = None,
     ) -> None:
         super().__init__()
@@ -366,6 +369,7 @@ class FFmpegDesktopCaptureTrack(MediaStreamTrack):
         self.height = height
         self.fps = fps
         self.quality_profile = quality_profile
+        self.include_cursor = include_cursor
         self.on_message = on_message
 
         packet_queue_size = 64 if (width * height) > (1920 * 1080) else max(8, min(16, fps // 2 or 1))
@@ -417,6 +421,7 @@ class FFmpegDesktopCaptureTrack(MediaStreamTrack):
     def _reader_worker(self) -> None:
         container = None
         first_pts: int | None = None
+        waiting_for_keyframe = True
         try:
             process = self._ensure_process()
             if process.stdout is None:
@@ -441,6 +446,10 @@ class FFmpegDesktopCaptureTrack(MediaStreamTrack):
                     break
                 if not packet.size or packet.pts is None:
                     continue
+                if waiting_for_keyframe:
+                    if not packet.is_keyframe:
+                        continue
+                    waiting_for_keyframe = False
                 if first_pts is None:
                     first_pts = packet.pts
                 packet.pts -= first_pts
@@ -468,6 +477,7 @@ class FFmpegDesktopCaptureTrack(MediaStreamTrack):
                 output_height=self.height,
                 fps=self.fps,
                 quality_profile=self.quality_profile,
+                include_cursor=self.include_cursor,
                 output_target="pipe:1",
             )
             self._process = subprocess.Popen(
@@ -476,6 +486,7 @@ class FFmpegDesktopCaptureTrack(MediaStreamTrack):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 bufsize=0,
+                **hidden_subprocess_kwargs(),
             )
             return self._process
 
@@ -548,7 +559,8 @@ class HostStreamer:
         self.video_relay = MediaRelay()
         self.audio_relay = MediaRelay()
         self.signaling: HostSignalingServer | None = None
-        self.encoder = detect_best_encoder()
+        ensure_webrtc_video_codecs_registered()
+        self.encoder = detect_best_encoder_for_format(config.video_codec)
         self.quality_profile = resolve_quality_profile(config.resolution_label, config.quality)
         self._use_ffmpeg_packet_pipeline = False
         self._use_direct_desktop_capture = False
@@ -561,7 +573,7 @@ class HostStreamer:
             return
         self._running = True
 
-        if (self.config.frame_width * self.config.frame_height) > (1920 * 1080):
+        if self.encoder.video_codec == "h264" and (self.config.frame_width * self.config.frame_height) > (1920 * 1080):
             fallback_width, fallback_height = scale_to_fit(
                 self.config.monitor_region["width"],
                 self.config.monitor_region["height"],
@@ -578,7 +590,7 @@ class HostStreamer:
                 )
 
         self._use_ffmpeg_packet_pipeline = (
-            self.encoder.codec == "h264_nvenc"
+            self.encoder.codec in {"h264_nvenc", "hevc_nvenc"}
             and self.encoder.ffmpeg_codec_available
             and self.encoder.ffmpeg_path is not None
         )
@@ -592,7 +604,7 @@ class HostStreamer:
 
         if not self._use_ffmpeg_packet_pipeline:
             try:
-                apply_aiortc_h264_profile(
+                apply_runtime_video_profile(
                     self.encoder,
                     width=self.config.frame_width,
                     height=self.config.frame_height,
@@ -635,9 +647,10 @@ class HostStreamer:
                 height=self.config.frame_height,
                 fps=self.config.fps,
                 quality_profile=self.quality_profile,
+                include_cursor=False,
                 on_message=self._safe_emit_toast,
             )
-            self._safe_emit_toast("Streaming video through FFmpeg desktop duplication with NVENC.")
+            self._safe_emit_toast(f"Streaming {self.encoder.transport_codec.split('/')[-1]} through FFmpeg desktop duplication with NVENC.")
         elif self._use_ffmpeg_packet_pipeline:
             self.video_track = FFmpegPacketTrack(
                 self.capture_worker,
@@ -650,7 +663,7 @@ class HostStreamer:
                 quality_profile=self.quality_profile,
                 on_message=self._safe_emit_toast,
             )
-            self._safe_emit_toast("Streaming video through the bundled FFmpeg NVENC pipeline.")
+            self._safe_emit_toast(f"Streaming {self.encoder.transport_codec.split('/')[-1]} through the bundled FFmpeg pipeline.")
         else:
             self.video_track = SharedScreenTrack(self.capture_worker)
 
@@ -717,7 +730,7 @@ class HostStreamer:
         offer = payload["offer"]
         pc = RTCPeerConnection(
             RTCConfiguration(
-                iceServers=[RTCIceServer(urls=STUN_SERVER_URLS)],
+                iceServers=[RTCIceServer(**settings) for settings in ice_server_settings()],
             )
         )
         peer_id = secrets.token_hex(4)
@@ -729,7 +742,7 @@ class HostStreamer:
                 asyncio.create_task(self._drop_peer(peer_id))
 
         video_sender = pc.addTrack(self.video_relay.subscribe(self.video_track, buffered=False))
-        self._prefer_h264(pc, video_sender)
+        self._prefer_video_codec(pc, video_sender)
 
         if self.audio_track is not None:
             pc.addTrack(self.audio_relay.subscribe(self.audio_track))
@@ -819,14 +832,9 @@ class HostStreamer:
                     }
                 )
 
-    def _prefer_h264(self, pc: RTCPeerConnection, sender: object) -> None:
+    def _prefer_video_codec(self, pc: RTCPeerConnection, sender: object) -> None:
         try:
-            capabilities = RTCRtpSender.getCapabilities("video")
-            preferred = [
-                codec
-                for codec in capabilities.codecs
-                if codec.mimeType.lower() == "video/h264"
-            ]
+            preferred = preferred_video_capabilities([self.encoder.video_codec])
             for transceiver in pc.getTransceivers():
                 if transceiver.sender == sender and preferred:
                     transceiver.setCodecPreferences(preferred)

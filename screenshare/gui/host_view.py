@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import threading
 import tkinter as tk
 from concurrent.futures import Future
 from contextlib import suppress
@@ -13,11 +14,15 @@ from screenshare.network.session import (
     FPS_PRESETS,
     QUALITY_PRESETS,
     HostSessionConfig,
+    VIDEO_CODEC_PRESETS,
     detect_local_ip,
     format_bitrate,
     generate_session_pin,
+    has_turn_server_config,
 )
+from screenshare.network.public_access import PublicJoinInfo, resolve_public_join_info
 from screenshare.stream.sender import HostStreamer
+from screenshare.stream.video_codecs import normalize_video_codec
 from screenshare.utils.resolution import available_resolution_labels, list_monitors, resolve_resolution
 
 
@@ -61,6 +66,8 @@ class HostView(ctk.CTkFrame):
         self.capture_fps_var = tk.StringVar(value="0.0 FPS")
         self.encoder_var = tk.StringVar(value="Pending")
         self.actual_resolution_var = tk.StringVar(value="Pending")
+        self.public_code_var = tk.StringVar(value="Waiting for session start")
+        self.public_endpoint_var = tk.StringVar(value="Start sharing to resolve")
 
         self._build_layout()
         self.after(60, self._poll_events)
@@ -88,17 +95,45 @@ class HostView(ctk.CTkFrame):
 
         identity = ctk.CTkFrame(header, fg_color="#10283d", corner_radius=18)
         identity.grid(row=0, column=2, padx=18, pady=18, sticky="e")
-        ctk.CTkLabel(identity, text=f"Host IP  {self.host_ip}", font=ctk.CTkFont(size=15, weight="bold")).grid(
-            row=0, column=0, padx=20, pady=(14, 6), sticky="w"
-        )
+        identity.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(identity, text=f"Session PIN  {self.pin}", font=ctk.CTkFont(size=22, weight="bold")).grid(
-            row=1, column=0, padx=20, pady=(0, 16), sticky="w"
+            row=0, column=0, columnspan=2, padx=20, pady=(14, 10), sticky="w"
         )
         ctk.CTkLabel(
             identity,
             text="Local test on same PC: 127.0.0.1",
             text_color="#c7d5e0",
-        ).grid(row=2, column=0, padx=20, pady=(0, 14), sticky="w")
+        ).grid(row=1, column=0, columnspan=2, padx=20, pady=(0, 14), sticky="w")
+        ctk.CTkLabel(
+            identity,
+            text="Internet Join Code",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            text_color="#86efac",
+        ).grid(row=2, column=0, columnspan=2, padx=20, pady=(0, 6), sticky="w")
+        self.public_code_entry = ctk.CTkEntry(
+            identity,
+            width=290,
+            textvariable=self.public_code_var,
+            state="readonly",
+        )
+        self.public_code_entry.grid(row=3, column=0, padx=(20, 8), pady=(0, 8), sticky="ew")
+        self.public_code_entry.bind("<Button-1>", self._select_join_code)
+        self.copy_join_code_button = ctk.CTkButton(
+            identity,
+            text="Copy",
+            width=74,
+            height=34,
+            state="disabled",
+            command=self._copy_join_code,
+        )
+        self.copy_join_code_button.grid(row=3, column=1, padx=(0, 20), pady=(0, 8), sticky="e")
+        ctk.CTkLabel(
+            identity,
+            textvariable=self.public_endpoint_var,
+            text_color="#c7d5e0",
+            wraplength=360,
+            justify="left",
+        ).grid(row=4, column=0, columnspan=2, padx=20, pady=(0, 14), sticky="w")
 
         controls = ctk.CTkFrame(self, width=340, corner_radius=22)
         controls.grid(row=1, column=0, padx=(22, 12), pady=(0, 22), sticky="ns")
@@ -131,13 +166,18 @@ class HostView(ctk.CTkFrame):
         self.quality_menu.grid(row=8, column=0, padx=20, pady=(0, 14), sticky="ew")
         self.quality_menu.set("Balanced")
 
+        ctk.CTkLabel(controls, text="Video Encoder Format").grid(row=9, column=0, padx=20, pady=(0, 6), sticky="w")
+        self.video_codec_menu = ctk.CTkComboBox(controls, values=list(VIDEO_CODEC_PRESETS))
+        self.video_codec_menu.grid(row=10, column=0, padx=20, pady=(0, 14), sticky="ew")
+        self.video_codec_menu.set("H.264")
+
         self.system_audio_switch = ctk.CTkSwitch(controls, text="Share system audio")
-        self.system_audio_switch.grid(row=9, column=0, padx=20, pady=(6, 10), sticky="w")
+        self.system_audio_switch.grid(row=11, column=0, padx=20, pady=(6, 10), sticky="w")
         self.microphone_switch = ctk.CTkSwitch(controls, text="Share microphone")
-        self.microphone_switch.grid(row=10, column=0, padx=20, pady=(0, 16), sticky="w")
+        self.microphone_switch.grid(row=12, column=0, padx=20, pady=(0, 16), sticky="w")
 
         action_row = ctk.CTkFrame(controls, fg_color="transparent")
-        action_row.grid(row=11, column=0, padx=20, pady=(6, 20), sticky="ew")
+        action_row.grid(row=13, column=0, padx=20, pady=(6, 20), sticky="ew")
         action_row.grid_columnconfigure((0, 1), weight=1)
 
         self.start_button = ctk.CTkButton(action_row, text="Start Sharing", height=46, command=self._start_host)
@@ -159,7 +199,7 @@ class HostView(ctk.CTkFrame):
             wraplength=300,
             justify="left",
             text_color="#9aa6b2",
-        ).grid(row=12, column=0, padx=20, pady=(0, 22), sticky="w")
+        ).grid(row=14, column=0, padx=20, pady=(0, 22), sticky="w")
 
         surface = ctk.CTkFrame(self, corner_radius=22)
         surface.grid(row=1, column=1, padx=(12, 22), pady=(0, 22), sticky="nsew")
@@ -232,6 +272,7 @@ class HostView(ctk.CTkFrame):
             quality=self.quality_menu.get(),
             share_system_audio=bool(self.system_audio_switch.get()),
             share_microphone=bool(self.microphone_switch.get()),
+            video_codec=normalize_video_codec(self.video_codec_menu.get()),
         )
 
     def _start_host(self) -> None:
@@ -285,6 +326,8 @@ class HostView(ctk.CTkFrame):
                     self._handle_start_done(payload)
                 elif kind == "stop_done":
                     self._handle_stop_done(payload)
+                elif kind == "public_info":
+                    self._handle_public_info(payload)
         except queue.Empty:
             pass
 
@@ -303,7 +346,11 @@ class HostView(ctk.CTkFrame):
 
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
-        self.status_var.set("Session is live. Share the IP and PIN with viewers. For same-machine testing, join 127.0.0.1.")
+        self.status_var.set("Session is live. Share the internet join code or the LAN IP and PIN with viewers. For same-machine testing, join 127.0.0.1.")
+        self.public_code_var.set("Resolving...")
+        self.public_endpoint_var.set("Public signaling endpoint is being discovered.")
+        self.copy_join_code_button.configure(state="disabled")
+        self._resolve_public_join_async()
 
     def _handle_stop_done(self, future: Future[Any]) -> None:
         try:
@@ -317,6 +364,9 @@ class HostView(ctk.CTkFrame):
         self.viewers_var.set("0")
         self.bitrate_var.set("0 Mbps")
         self.latency_var.set("0 ms")
+        self.public_code_var.set("Waiting for session start")
+        self.public_endpoint_var.set("Start sharing to resolve")
+        self.copy_join_code_button.configure(state="disabled")
 
     def _update_preview(self, image) -> None:
         self._preview_ref = ImageTk.PhotoImage(image=image)
@@ -345,6 +395,52 @@ class HostView(ctk.CTkFrame):
         toast.geometry(f"+{max(x, 20)}+{max(y, 20)}")
         toast.after(3200, toast.destroy)
         self._toast_window = toast
+
+    def _resolve_public_join_async(self) -> None:
+        if self._service is None:
+            return
+
+        config = self._service.config
+        turn_enabled = has_turn_server_config()
+
+        def _worker() -> None:
+            info = resolve_public_join_info(
+                pin=config.pin,
+                signaling_port=config.signaling_port,
+                turn_enabled=turn_enabled,
+            )
+            _enqueue_latest(self._events, ("public_info", info))
+
+        threading.Thread(target=_worker, name="public-join-resolver", daemon=True).start()
+
+    def _handle_public_info(self, info: PublicJoinInfo) -> None:
+        if self._service is None:
+            return
+        if info.join_code:
+            self.public_code_var.set(info.join_code)
+            self.public_endpoint_var.set(f"Public endpoint  {info.public_host}:{info.signaling_port}")
+            self.copy_join_code_button.configure(state="normal")
+        else:
+            self.public_code_var.set("Unavailable")
+            self.public_endpoint_var.set(info.summary)
+            self.copy_join_code_button.configure(state="disabled")
+        if info.detail and not info.join_code:
+            self._show_toast(info.detail)
+
+    def _select_join_code(self, _event=None) -> None:
+        self.public_code_entry.focus_set()
+        self.public_code_entry.selection_range(0, "end")
+
+    def _copy_join_code(self) -> None:
+        join_code = self.public_code_var.get().strip()
+        if not join_code or join_code in {"Waiting for session start", "Resolving...", "Unavailable"}:
+            self._show_toast("The internet join code is not ready yet.")
+            return
+        root = self.winfo_toplevel()
+        root.clipboard_clear()
+        root.clipboard_append(join_code)
+        root.update_idletasks()
+        self._show_toast("Internet join code copied to the clipboard.")
 
     def _go_back(self) -> None:
         if self._service is not None:

@@ -15,6 +15,10 @@ except Exception:  # pragma: no cover - optional at import time
     av = None
     VideoCodecContext = object  # type: ignore[assignment]
 
+from screenshare.stream.hevc import H265RuntimeConfig, configure_h265_runtime
+from screenshare.stream.video_codecs import ensure_webrtc_video_codecs_registered, get_video_codec_spec
+from screenshare.utils.process import hidden_subprocess_kwargs
+
 
 TextCallback = Callable[[str], None]
 
@@ -36,6 +40,7 @@ class GpuInfo:
 @dataclass(slots=True)
 class EncoderSelection:
     ffmpeg_path: str | None
+    video_codec: str
     codec: str
     transport_codec: str
     display_name: str
@@ -100,6 +105,12 @@ def resolve_quality_profile(resolution_label: str, quality: str) -> QualityProfi
 
 
 def detect_best_encoder(ffmpeg_path: str | None = None) -> EncoderSelection:
+    return detect_best_encoder_for_format("h264", ffmpeg_path=ffmpeg_path)
+
+
+def detect_best_encoder_for_format(video_codec: str, ffmpeg_path: str | None = None) -> EncoderSelection:
+    ensure_webrtc_video_codecs_registered()
+    spec = get_video_codec_spec(video_codec)
     ffmpeg_path = resolve_ffmpeg_binary(ffmpeg_path)
     av_codecs = _read_av_codecs()
     ffmpeg_encoders = _read_encoders(ffmpeg_path) if ffmpeg_path else set()
@@ -108,38 +119,34 @@ def detect_best_encoder(ffmpeg_path: str | None = None) -> EncoderSelection:
     system = platform.system().lower()
 
     notes: list[str] = []
-    if gpu and gpu.is_nvidia and "h264_nvenc" in ffmpeg_encoders:
-        label = "NVIDIA RTX NVENC H.264" if gpu.is_rtx else "NVIDIA NVENC H.264"
-        if "h264_nvenc" not in av_codecs:
+    if gpu and gpu.is_nvidia and spec.nvidia_encoder in ffmpeg_encoders:
+        label = f"NVIDIA RTX NVENC {spec.label}" if gpu.is_rtx else f"NVIDIA NVENC {spec.label}"
+        if spec.nvidia_encoder not in av_codecs:
             notes.append(
-                f"{gpu.name} detected. PyAV does not expose h264_nvenc, so the app will use the bundled FFmpeg NVENC pipeline."
+                f"{gpu.name} detected. PyAV does not expose {spec.nvidia_encoder}, so the app will use the bundled FFmpeg pipeline."
             )
         return EncoderSelection(
             ffmpeg_path=ffmpeg_path,
-            codec="h264_nvenc",
-            transport_codec="video/H264",
+            video_codec=spec.key,
+            codec=spec.nvidia_encoder,
+            transport_codec=spec.mime_type,
             display_name=f"{label} ({gpu.name})",
             hardware_accelerated=True,
             gpu_name=gpu.name,
-            runtime_codec_available="h264_nvenc" in av_codecs,
+            runtime_codec_available=spec.nvidia_encoder in av_codecs,
             ffmpeg_codec_available=True,
             notes=tuple(notes),
         )
 
-    candidates: list[tuple[str, str]] = []
-    if "windows" in system:
-        candidates.extend([("h264_qsv", "Intel Quick Sync H.264")])
-    elif "darwin" in system:
-        candidates.extend([("h264_videotoolbox", "Apple VideoToolbox H.264")])
-    elif "linux" in system:
-        candidates.extend([("h264_vaapi", "VAAPI H.264")])
+    candidates = list(spec.platform_hardware_candidates.get(system, ()))
 
     for codec_name, label in candidates:
         if codec_name in av_codecs or codec_name in ffmpeg_encoders:
             return EncoderSelection(
                 ffmpeg_path=ffmpeg_path,
+                video_codec=spec.key,
                 codec=codec_name,
-                transport_codec="video/H264",
+                transport_codec=spec.mime_type,
                 display_name=label,
                 hardware_accelerated=True,
                 gpu_name=gpu.name if gpu else None,
@@ -150,18 +157,19 @@ def detect_best_encoder(ffmpeg_path: str | None = None) -> EncoderSelection:
 
     if gpu and gpu.is_nvidia:
         notes.append(
-            f"{gpu.name} detected, but bundled FFmpeg does not expose h264_nvenc on this system. Using tuned libx264."
+            f"{gpu.name} detected, but bundled FFmpeg does not expose {spec.nvidia_encoder} on this system. Using tuned {spec.software_encoder}."
         )
 
     return EncoderSelection(
         ffmpeg_path=ffmpeg_path,
-        codec="libx264",
-        transport_codec="video/H264",
-        display_name=f"Tuned libx264 ({gpu.name})" if gpu else "Tuned libx264",
+        video_codec=spec.key,
+        codec=spec.software_encoder,
+        transport_codec=spec.mime_type,
+        display_name=f"Tuned {spec.software_encoder} ({gpu.name})" if gpu else f"Tuned {spec.software_encoder}",
         hardware_accelerated=False,
         gpu_name=gpu.name if gpu else None,
-        runtime_codec_available="libx264" in av_codecs,
-        ffmpeg_codec_available="libx264" in ffmpeg_encoders,
+        runtime_codec_available=spec.software_encoder in av_codecs,
+        ffmpeg_codec_available=spec.software_encoder in ffmpeg_encoders,
         notes=tuple(notes),
     )
 
@@ -249,6 +257,75 @@ def apply_aiortc_h264_profile(
     return profile
 
 
+def build_h265_runtime_profile(
+    selection: EncoderSelection,
+    *,
+    width: int,
+    height: int,
+    fps: int,
+    quality_profile: QualityProfile,
+) -> H265RuntimeConfig:
+    bitrate_bps = parse_bitrate_to_bps(quality_profile.target_bitrate)
+    max_bitrate_bps = parse_bitrate_to_bps(quality_profile.max_bitrate)
+    gop_size = max(fps, 30)
+
+    if selection.codec == "hevc_nvenc":
+        options = _build_hevc_nvenc_options(quality_profile, gop_size)
+    else:
+        options = _build_x265_options(quality_profile, gop_size, width, height)
+
+    fallback_options = _build_x265_options(quality_profile, gop_size, width, height)
+    return H265RuntimeConfig(
+        codec=selection.codec,
+        fallback_codec="libx265",
+        fps=fps,
+        gop_size=gop_size,
+        bitrate_bps=bitrate_bps,
+        max_bitrate_bps=max_bitrate_bps,
+        options=options,
+        fallback_options=fallback_options,
+    )
+
+
+def apply_runtime_video_profile(
+    selection: EncoderSelection,
+    *,
+    width: int,
+    height: int,
+    fps: int,
+    quality_profile: QualityProfile,
+    on_message: TextCallback | None = None,
+) -> H264RuntimeProfile | H265RuntimeConfig:
+    ensure_webrtc_video_codecs_registered()
+    if selection.video_codec == "h264":
+        return apply_aiortc_h264_profile(
+            selection,
+            width=width,
+            height=height,
+            fps=fps,
+            quality_profile=quality_profile,
+            on_message=on_message,
+        )
+
+    profile = build_h265_runtime_profile(
+        selection,
+        width=width,
+        height=height,
+        fps=fps,
+        quality_profile=quality_profile,
+    )
+    configure_h265_runtime(profile, on_message=on_message)
+
+    if selection.notes:
+        for note in selection.notes:
+            _emit_once(note)
+
+    if selection.hardware_accelerated and selection.gpu_name:
+        _emit_once(f"{selection.gpu_name} detected. Streaming will prefer {selection.display_name}.")
+
+    return profile
+
+
 def build_ffmpeg_command(
     selection: EncoderSelection,
     *,
@@ -284,18 +361,75 @@ def build_ffmpeg_command(
         "-bufsize",
         quality_profile.buffer_size,
     ]
-    if selection.codec == "h264_nvenc":
-        runtime = build_h264_runtime_profile(
-            selection,
-            width=width,
-            height=height,
-            fps=fps,
-            quality_profile=quality_profile,
-        )
-        for option_name, option_value in runtime.options.items():
-            command.extend([f"-{option_name}", option_value])
+
+    if selection.video_codec == "h264":
+        if selection.codec == "h264_nvenc":
+            runtime = build_h264_runtime_profile(
+                selection,
+                width=width,
+                height=height,
+                fps=fps,
+                quality_profile=quality_profile,
+            )
+            for option_name, option_value in runtime.options.items():
+                command.extend([f"-{option_name}", option_value])
+        else:
+            command.extend(["-preset", quality_profile.preset_name, "-tune", quality_profile.tune])
     else:
-        command.extend(["-preset", quality_profile.preset_name, "-tune", quality_profile.tune])
+        if selection.codec == "hevc_nvenc":
+            runtime = build_h265_runtime_profile(
+                selection,
+                width=width,
+                height=height,
+                fps=fps,
+                quality_profile=quality_profile,
+            )
+            command.extend(
+                [
+                    "-profile:v",
+                    "main",
+                    "-preset",
+                    runtime.options["preset"],
+                    "-tune",
+                    runtime.options["tune"],
+                    "-rc",
+                    runtime.options["rc"],
+                    "-g",
+                    str(runtime.gop_size),
+                    "-bf",
+                    "0",
+                    "-forced-idr",
+                    "1",
+                    "-zerolatency",
+                    "1",
+                    "-spatial_aq",
+                    runtime.options["spatial_aq"],
+                    "-aq-strength",
+                    runtime.options["aq-strength"],
+                    "-temporal_aq",
+                    runtime.options["temporal_aq"],
+                    "-rc-lookahead",
+                    runtime.options["rc-lookahead"],
+                ]
+            )
+        else:
+            runtime = build_h265_runtime_profile(
+                selection,
+                width=width,
+                height=height,
+                fps=fps,
+                quality_profile=quality_profile,
+            )
+            command.extend(
+                [
+                    "-preset",
+                    runtime.options["preset"],
+                    "-tune",
+                    runtime.options["tune"],
+                    "-x265-params",
+                    runtime.options["x265-params"],
+                ]
+            )
     command.extend(["-f", output_target, "-"])
     return command
 
@@ -316,12 +450,22 @@ def build_ffmpeg_packet_command(
     if ffmpeg_path is None:
         raise RuntimeError("FFmpeg is not available for the hardware packet pipeline.")
 
-    runtime = build_h264_runtime_profile(
-        selection,
-        width=output_width,
-        height=output_height,
-        fps=fps,
-        quality_profile=quality_profile,
+    runtime = (
+        build_h264_runtime_profile(
+            selection,
+            width=output_width,
+            height=output_height,
+            fps=fps,
+            quality_profile=quality_profile,
+        )
+        if selection.video_codec == "h264"
+        else build_h265_runtime_profile(
+            selection,
+            width=output_width,
+            height=output_height,
+            fps=fps,
+            quality_profile=quality_profile,
+        )
     )
 
     command = [
@@ -358,8 +502,6 @@ def build_ffmpeg_packet_command(
         "yuv420p",
         "-c:v",
         selection.codec,
-        "-profile:v",
-        "baseline",
         "-b:v",
         quality_profile.target_bitrate,
         "-maxrate:v",
@@ -369,48 +511,92 @@ def build_ffmpeg_packet_command(
         ]
     )
 
-    if selection.codec == "h264_nvenc":
-        command.extend(
-            [
-                "-preset",
-                runtime.options["preset"],
-                "-tune",
-                runtime.options["tune"],
-                "-rc",
-                runtime.options["rc"],
-                "-g",
-                str(runtime.gop_size),
-                "-bf",
-                "0",
-                "-forced-idr",
-                "1",
-                "-zerolatency",
-                "1",
-                "-spatial_aq",
-                runtime.options["spatial_aq"],
-                "-aq-strength",
-                runtime.options["aq-strength"],
-                "-temporal_aq",
-                runtime.options["temporal_aq"],
-                "-rc-lookahead",
-                runtime.options["rc-lookahead"],
-            ]
-        )
+    if selection.video_codec == "h264":
+        command.extend(["-profile:v", "baseline"])
+        if selection.codec == "h264_nvenc":
+            command.extend(
+                [
+                    "-preset",
+                    runtime.options["preset"],
+                    "-tune",
+                    runtime.options["tune"],
+                    "-rc",
+                    runtime.options["rc"],
+                    "-g",
+                    str(runtime.gop_size),
+                    "-bf",
+                    "0",
+                    "-forced-idr",
+                    "1",
+                    "-zerolatency",
+                    "1",
+                    "-spatial_aq",
+                    runtime.options["spatial_aq"],
+                    "-aq-strength",
+                    runtime.options["aq-strength"],
+                    "-temporal_aq",
+                    runtime.options["temporal_aq"],
+                    "-rc-lookahead",
+                    runtime.options["rc-lookahead"],
+                ]
+            )
+        else:
+            command.extend(
+                [
+                    "-preset",
+                    runtime.options["preset"],
+                    "-tune",
+                    runtime.options["tune"],
+                    "-g",
+                    str(runtime.gop_size),
+                    "-keyint_min",
+                    str(runtime.gop_size),
+                    "-x264-params",
+                    runtime.options["x264-params"],
+                ]
+            )
     else:
-        command.extend(
-            [
-                "-preset",
-                runtime.options["preset"],
-                "-tune",
-                runtime.options["tune"],
-                "-g",
-                str(runtime.gop_size),
-                "-keyint_min",
-                str(runtime.gop_size),
-                "-x264-params",
-                runtime.options["x264-params"],
-            ]
-        )
+        command.extend(["-profile:v", "main"])
+        if selection.codec == "hevc_nvenc":
+            command.extend(
+                [
+                    "-preset",
+                    runtime.options["preset"],
+                    "-tune",
+                    runtime.options["tune"],
+                    "-rc",
+                    runtime.options["rc"],
+                    "-g",
+                    str(runtime.gop_size),
+                    "-bf",
+                    "0",
+                    "-forced-idr",
+                    "1",
+                    "-zerolatency",
+                    "1",
+                    "-spatial_aq",
+                    runtime.options["spatial_aq"],
+                    "-aq-strength",
+                    runtime.options["aq-strength"],
+                    "-temporal_aq",
+                    runtime.options["temporal_aq"],
+                    "-rc-lookahead",
+                    runtime.options["rc-lookahead"],
+                ]
+            )
+        else:
+            command.extend(
+                [
+                    "-preset",
+                    runtime.options["preset"],
+                    "-tune",
+                    runtime.options["tune"],
+                    "-g",
+                    str(runtime.gop_size),
+                    "-x265-params",
+                    runtime.options["x265-params"],
+                ]
+            )
 
     command.extend(
         [
@@ -442,18 +628,29 @@ def build_ffmpeg_desktop_packet_command(
     output_height: int,
     fps: int,
     quality_profile: QualityProfile,
+    include_cursor: bool = False,
     output_target: str = "pipe:1",
 ) -> list[str]:
     ffmpeg_path = selection.ffmpeg_path or resolve_ffmpeg_binary()
     if ffmpeg_path is None:
         raise RuntimeError("FFmpeg is not available for the desktop duplication pipeline.")
 
-    runtime = build_h264_runtime_profile(
-        selection,
-        width=output_width,
-        height=output_height,
-        fps=fps,
-        quality_profile=quality_profile,
+    runtime = (
+        build_h264_runtime_profile(
+            selection,
+            width=output_width,
+            height=output_height,
+            fps=fps,
+            quality_profile=quality_profile,
+        )
+        if selection.video_codec == "h264"
+        else build_h265_runtime_profile(
+            selection,
+            width=output_width,
+            height=output_height,
+            fps=fps,
+            quality_profile=quality_profile,
+        )
     )
 
     filter_chain = ["hwdownload", "format=bgra", f"fps={fps}"]
@@ -472,7 +669,7 @@ def build_ffmpeg_desktop_packet_command(
         "-i",
         (
             f"ddagrab=output_idx={max(0, monitor_index - 1)}:"
-            f"framerate={fps}:video_size={input_width}x{input_height}:draw_mouse=1:dup_frames=1"
+            f"framerate={fps}:video_size={input_width}x{input_height}:draw_mouse={1 if include_cursor else 0}:dup_frames=1"
         ),
         "-vf",
         ",".join(filter_chain),
@@ -481,8 +678,6 @@ def build_ffmpeg_desktop_packet_command(
         "yuv420p",
         "-c:v",
         selection.codec,
-        "-profile:v",
-        "baseline",
         "-b:v",
         quality_profile.target_bitrate,
         "-maxrate:v",
@@ -490,6 +685,11 @@ def build_ffmpeg_desktop_packet_command(
         "-bufsize:v",
         quality_profile.buffer_size,
     ]
+
+    if selection.video_codec == "h264":
+        command.extend(["-profile:v", "baseline"])
+    else:
+        command.extend(["-profile:v", "main"])
 
     command.extend(
         [
@@ -569,6 +769,7 @@ class FFmpegEncoderPipeline:
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            **hidden_subprocess_kwargs(),
         )
 
     def encode_frame(self, frame_bytes: bytes) -> None:
@@ -688,6 +889,45 @@ def _build_x264_options(
     }
 
 
+def _build_hevc_nvenc_options(quality_profile: QualityProfile, gop_size: int) -> dict[str, str]:
+    quality = quality_profile.quality_name
+    preset = {"High": "p6", "Balanced": "p5", "Low-latency": "p3"}[quality]
+    tune = {"High": "hq", "Balanced": "ll", "Low-latency": "ull"}[quality]
+    rate_control = "vbr" if quality == "High" else "cbr"
+    return {
+        "profile": "main",
+        "preset": preset,
+        "tune": tune,
+        "rc": rate_control,
+        "g": str(gop_size),
+        "bf": "0",
+        "forced-idr": "1",
+        "zerolatency": "1",
+        "spatial_aq": "1",
+        "aq-strength": "8" if quality == "High" else "6",
+        "temporal_aq": "1" if quality != "Low-latency" else "0",
+        "rc-lookahead": "8" if quality == "High" else "0",
+    }
+
+
+def _build_x265_options(
+    quality_profile: QualityProfile,
+    gop_size: int,
+    width: int,
+    height: int,
+) -> dict[str, str]:
+    preset = _resolve_realtime_x265_preset(quality_profile.quality_name, width, height)
+    return {
+        "profile": "main",
+        "preset": preset,
+        "tune": "zerolatency",
+        "x265-params": (
+            f"repeat-headers=1:keyint={gop_size}:min-keyint={gop_size}:"
+            "scenecut=0:bframes=0:no-open-gop=1"
+        ),
+    }
+
+
 def _resolve_realtime_x264_preset(quality: str, width: int, height: int) -> str:
     pixels = width * height
     if pixels >= 3840 * 2160:
@@ -696,6 +936,17 @@ def _resolve_realtime_x264_preset(quality: str, width: int, height: int) -> str:
         table = {"High": "faster", "Balanced": "veryfast", "Low-latency": "superfast"}
     else:
         table = {"High": "fast", "Balanced": "faster", "Low-latency": "veryfast"}
+    return table[quality]
+
+
+def _resolve_realtime_x265_preset(quality: str, width: int, height: int) -> str:
+    pixels = width * height
+    if pixels >= 3840 * 2160:
+        table = {"High": "faster", "Balanced": "superfast", "Low-latency": "ultrafast"}
+    elif pixels >= 1920 * 1080:
+        table = {"High": "fast", "Balanced": "faster", "Low-latency": "superfast"}
+    else:
+        table = {"High": "fast", "Balanced": "veryfast", "Low-latency": "faster"}
     return table[quality]
 
 
@@ -747,6 +998,7 @@ def _detect_gpu_with_nvidia_smi() -> GpuInfo | None:
             text=True,
             check=True,
             timeout=2,
+            **hidden_subprocess_kwargs(),
         )
     except Exception:
         return None
@@ -784,6 +1036,7 @@ def _detect_gpu_with_windows_cim() -> GpuInfo | None:
             text=True,
             check=True,
             timeout=2,
+            **hidden_subprocess_kwargs(),
         )
     except Exception:
         return None
@@ -813,6 +1066,7 @@ def _detect_gpu_with_lspci() -> GpuInfo | None:
             text=True,
             check=True,
             timeout=2,
+            **hidden_subprocess_kwargs(),
         )
     except Exception:
         return None
@@ -857,6 +1111,7 @@ def _read_encoders(ffmpeg_path: str) -> set[str]:
             text=True,
             check=True,
             timeout=3,
+            **hidden_subprocess_kwargs(),
         )
     except Exception:
         return set()
@@ -875,6 +1130,7 @@ def _read_filters(ffmpeg_path: str) -> set[str]:
             text=True,
             check=True,
             timeout=3,
+            **hidden_subprocess_kwargs(),
         )
     except Exception:
         return set()
