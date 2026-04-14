@@ -123,6 +123,7 @@ The launch screen presents the two modes.
 - The signaling server listens on TCP port `8765` on the host machine.
 - The packaged Windows app now carries its own `ffmpeg.exe` via `imageio-ffmpeg`, so NVENC does not depend on a separate FFmpeg install.
 - On Windows and Linux, the host probes for NVIDIA GPUs and uses a bundled FFmpeg `h264_nvenc` packet pipeline automatically when available.
+- On Windows with NVENC available, the `1080p/60` path now uses FFmpeg Desktop Duplication (`ddagrab`) for the actual stream source, so the reported FPS reflects the real stream pipeline instead of the lightweight preview capture loop.
 - If an RTX GPU is detected but NVENC cannot be opened, the app falls back to a tuned `libx264` profile and shows a toast so the user knows why GPU offload is unavailable.
 - The H.264 runtime is now tuned for real-time screen sharing: fixed GOPs, dynamic H.264 level selection, 60 FPS support, and lower-latency encoder presets.
 - The accelerated NVENC path now avoids Python-side RGB conversion and resizing by passing raw `mss` BGRA frames straight into FFmpeg, which materially improves capture throughput on large desktops.

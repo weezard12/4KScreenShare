@@ -6,6 +6,7 @@ import secrets
 import subprocess
 import threading
 import time
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -34,8 +35,10 @@ from screenshare.network.session import (
 from screenshare.network.signaling import HostSignalingServer
 from screenshare.stream.encoder import (
     apply_aiortc_h264_profile,
+    build_ffmpeg_desktop_packet_command,
     build_ffmpeg_packet_command,
     detect_best_encoder,
+    ffmpeg_supports_filter,
     resolve_quality_profile,
 )
 from screenshare.utils.resolution import scale_to_fit
@@ -152,6 +155,7 @@ class FFmpegPacketTrack(MediaStreamTrack):
         self._process: subprocess.Popen[bytes] | None = None
         self._process_lock = threading.Lock()
         self._last_sequence = 0
+        self._packet_times: deque[float] = deque(maxlen=max(120, fps * 4))
 
     async def recv(self) -> av.Packet:
         if self.readyState != "live":
@@ -228,6 +232,7 @@ class FFmpegPacketTrack(MediaStreamTrack):
     def _reader_worker(self) -> None:
         container = None
         first_pts: int | None = None
+        waiting_for_keyframe = True
         try:
             process = self._ensure_process()
             if process.stdout is None:
@@ -252,6 +257,10 @@ class FFmpegPacketTrack(MediaStreamTrack):
                     break
                 if not packet.size or packet.pts is None:
                     continue
+                if waiting_for_keyframe:
+                    if not packet.is_keyframe:
+                        continue
+                    waiting_for_keyframe = False
                 if first_pts is None:
                     first_pts = packet.pts
                 packet.pts -= first_pts
@@ -293,6 +302,7 @@ class FFmpegPacketTrack(MediaStreamTrack):
     def _queue_packet(self, packet: av.Packet) -> None:
         if self._loop is None or self._quit.is_set():
             return
+        self._packet_times.append(time.perf_counter())
         self._loop.call_soon_threadsafe(self._put_latest_packet, packet)
 
     def _queue_terminal(self) -> None:
@@ -321,6 +331,192 @@ class FFmpegPacketTrack(MediaStreamTrack):
 
         with suppress(asyncio.QueueFull):
             self._queue.put_nowait(packet)
+
+    def get_capture_fps(self) -> float:
+        if len(self._packet_times) < 2:
+            return float(self.fps)
+        elapsed = self._packet_times[-1] - self._packet_times[0]
+        if elapsed <= 0:
+            return float(self.fps)
+        return (len(self._packet_times) - 1) / elapsed
+
+
+class FFmpegDesktopCaptureTrack(MediaStreamTrack):
+    kind = "video"
+
+    def __init__(
+        self,
+        *,
+        selection,
+        monitor_index: int,
+        input_width: int,
+        input_height: int,
+        width: int,
+        height: int,
+        fps: int,
+        quality_profile,
+        on_message: TextCallback | None = None,
+    ) -> None:
+        super().__init__()
+        self.selection = selection
+        self.monitor_index = monitor_index
+        self.input_width = input_width
+        self.input_height = input_height
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.quality_profile = quality_profile
+        self.on_message = on_message
+
+        packet_queue_size = 64 if (width * height) > (1920 * 1080) else max(8, min(16, fps // 2 or 1))
+        self._queue: asyncio.Queue[av.Packet | None] = asyncio.Queue(maxsize=packet_queue_size)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._worker_started = False
+        self._quit = threading.Event()
+        self._reader_thread: threading.Thread | None = None
+        self._process: subprocess.Popen[bytes] | None = None
+        self._process_lock = threading.Lock()
+        self._packet_times: deque[float] = deque(maxlen=max(120, fps * 4))
+
+    async def recv(self) -> av.Packet:
+        if self.readyState != "live":
+            raise MediaStreamError
+
+        if not self._worker_started:
+            self._loop = asyncio.get_running_loop()
+            self._start_worker()
+
+        packet = await self._queue.get()
+        if packet is None:
+            self.stop()
+            raise MediaStreamError
+        return packet
+
+    def stop(self) -> None:
+        if self.readyState == "ended":
+            return
+        self._quit.set()
+        process = self._process
+        if process is not None:
+            with suppress(Exception):
+                process.kill()
+        current = threading.current_thread()
+        if self._reader_thread is not None and self._reader_thread.is_alive() and self._reader_thread is not current:
+            self._reader_thread.join(timeout=1.5)
+        super().stop()
+
+    def _start_worker(self) -> None:
+        self._worker_started = True
+        self._reader_thread = threading.Thread(
+            target=self._reader_worker,
+            name="ffmpeg-ddagrab-reader",
+            daemon=True,
+        )
+        self._reader_thread.start()
+
+    def _reader_worker(self) -> None:
+        container = None
+        first_pts: int | None = None
+        try:
+            process = self._ensure_process()
+            if process.stdout is None:
+                raise RuntimeError("FFmpeg stdout is unavailable.")
+            container = av.open(
+                _NonSeekablePipe(process.stdout),
+                format="mpegts",
+                mode="r",
+                options={
+                    "fflags": "nobuffer",
+                    "flags": "low_delay",
+                    "probesize": "32",
+                    "analyzeduration": "0",
+                },
+            )
+            video_stream = next((stream for stream in container.streams if stream.type == "video"), None)
+            if video_stream is None:
+                raise RuntimeError("FFmpeg did not expose a video stream.")
+
+            for packet in container.demux(video_stream):
+                if self._quit.is_set():
+                    break
+                if not packet.size or packet.pts is None:
+                    continue
+                if first_pts is None:
+                    first_pts = packet.pts
+                packet.pts -= first_pts
+                packet.dts = None if packet.dts is None else packet.dts - first_pts
+                self._queue_packet(packet)
+        except Exception as exc:
+            if not self._quit.is_set():
+                self._emit_message(f"Desktop duplication pipeline stopped: {exc}")
+        finally:
+            if container is not None:
+                with suppress(Exception):
+                    container.close()
+            self._queue_terminal()
+
+    def _ensure_process(self):
+        with self._process_lock:
+            if self._process is not None:
+                return self._process
+            command = build_ffmpeg_desktop_packet_command(
+                self.selection,
+                monitor_index=self.monitor_index,
+                input_width=self.input_width,
+                input_height=self.input_height,
+                output_width=self.width,
+                output_height=self.height,
+                fps=self.fps,
+                quality_profile=self.quality_profile,
+                output_target="pipe:1",
+            )
+            self._process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+            return self._process
+
+    def _queue_packet(self, packet: av.Packet) -> None:
+        if self._loop is None or self._quit.is_set():
+            return
+        self._packet_times.append(time.perf_counter())
+        self._loop.call_soon_threadsafe(self._put_latest_packet, packet)
+
+    def _queue_terminal(self) -> None:
+        if self._loop is None or self._quit.is_set():
+            return
+        self._quit.set()
+        self._loop.call_soon_threadsafe(self._put_latest_packet, None)
+
+    def _emit_message(self, message: str) -> None:
+        if self.on_message is not None:
+            self.on_message(message)
+
+    def _put_latest_packet(self, packet: av.Packet | None) -> None:
+        try:
+            self._queue.put_nowait(packet)
+            return
+        except asyncio.QueueFull:
+            pass
+
+        try:
+            self._queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+
+        with suppress(asyncio.QueueFull):
+            self._queue.put_nowait(packet)
+
+    def get_capture_fps(self) -> float:
+        if len(self._packet_times) < 2:
+            return float(self.fps)
+        elapsed = self._packet_times[-1] - self._packet_times[0]
+        if elapsed <= 0:
+            return float(self.fps)
+        return (len(self._packet_times) - 1) / elapsed
 
 
 @dataclass(slots=True)
@@ -355,6 +551,7 @@ class HostStreamer:
         self.encoder = detect_best_encoder()
         self.quality_profile = resolve_quality_profile(config.resolution_label, config.quality)
         self._use_ffmpeg_packet_pipeline = False
+        self._use_direct_desktop_capture = False
         self._peers: dict[str, PeerState] = {}
         self._stats_task: asyncio.Task[None] | None = None
         self._running = False
@@ -385,6 +582,10 @@ class HostStreamer:
             and self.encoder.ffmpeg_codec_available
             and self.encoder.ffmpeg_path is not None
         )
+        self._use_direct_desktop_capture = (
+            self._use_ffmpeg_packet_pipeline
+            and ffmpeg_supports_filter(self.encoder.ffmpeg_path, "ddagrab")
+        )
 
         for note in self.encoder.notes:
             self._safe_emit_toast(note)
@@ -402,18 +603,42 @@ class HostStreamer:
             except Exception as exc:
                 self._safe_emit_toast(f"Encoder optimizer warning: {exc}")
 
+        preview_fps = self.config.fps if not self._use_direct_desktop_capture else min(12, self.config.fps)
+        preview_size = (
+            (self.config.frame_width, self.config.frame_height)
+            if not self._use_direct_desktop_capture
+            else scale_to_fit(
+                self.config.monitor_region["width"],
+                self.config.monitor_region["height"],
+                960,
+                540,
+            )
+        )
         self.capture_worker = ScreenCaptureWorker(
             self.config.monitor_region,
-            target_size=(self.config.frame_width, self.config.frame_height),
-            fps=self.config.fps,
+            target_size=preview_size,
+            fps=preview_fps,
             on_preview=self._safe_emit_preview,
             on_toast=self._safe_emit_toast,
             allow_auto_downscale=not self._use_ffmpeg_packet_pipeline,
-            prefer_raw_bgra=self._use_ffmpeg_packet_pipeline,
+            prefer_raw_bgra=self._use_ffmpeg_packet_pipeline and not self._use_direct_desktop_capture,
         )
         self.capture_worker.start()
 
-        if self._use_ffmpeg_packet_pipeline:
+        if self._use_direct_desktop_capture:
+            self.video_track = FFmpegDesktopCaptureTrack(
+                selection=self.encoder,
+                monitor_index=self.config.monitor_index,
+                input_width=self.config.monitor_region["width"],
+                input_height=self.config.monitor_region["height"],
+                width=self.config.frame_width,
+                height=self.config.frame_height,
+                fps=self.config.fps,
+                quality_profile=self.quality_profile,
+                on_message=self._safe_emit_toast,
+            )
+            self._safe_emit_toast("Streaming video through FFmpeg desktop duplication with NVENC.")
+        elif self._use_ffmpeg_packet_pipeline:
             self.video_track = FFmpegPacketTrack(
                 self.capture_worker,
                 selection=self.encoder,
@@ -571,11 +796,16 @@ class HostStreamer:
                         if round_trip is not None:
                             latencies.append(float(round_trip) * 1000.0)
 
-            capture_fps = self.capture_worker.get_capture_fps() if self.capture_worker else 0.0
-            frame_width, frame_height = self.capture_worker.current_size if self.capture_worker else (
-                self.config.frame_width,
-                self.config.frame_height,
-            )
+            capture_fps = 0.0
+            if self.video_track is not None and hasattr(self.video_track, "get_capture_fps"):
+                try:
+                    capture_fps = float(getattr(self.video_track, "get_capture_fps")())
+                except Exception:
+                    capture_fps = 0.0
+            elif self.capture_worker is not None:
+                capture_fps = self.capture_worker.get_capture_fps()
+
+            frame_width, frame_height = self.config.frame_width, self.config.frame_height
 
             if self.on_stats is not None:
                 self.on_stats(
@@ -619,7 +849,11 @@ class HostStreamer:
                     "viewers": len(self._peers),
                     "bitrate_bps": 0.0,
                     "latency_ms": 0.0,
-                    "capture_fps": self.capture_worker.get_capture_fps() if self.capture_worker else 0.0,
+                    "capture_fps": (
+                        float(getattr(self.video_track, "get_capture_fps")())
+                        if self.video_track is not None and hasattr(self.video_track, "get_capture_fps")
+                        else self.capture_worker.get_capture_fps() if self.capture_worker else 0.0
+                    ),
                     "encoder": self.encoder.display_name,
                     "resolution": f"{self.config.frame_width}x{self.config.frame_height}",
                 }

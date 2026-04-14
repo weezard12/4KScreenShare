@@ -432,6 +432,114 @@ def build_ffmpeg_packet_command(
     return command
 
 
+def build_ffmpeg_desktop_packet_command(
+    selection: EncoderSelection,
+    *,
+    monitor_index: int,
+    input_width: int,
+    input_height: int,
+    output_width: int,
+    output_height: int,
+    fps: int,
+    quality_profile: QualityProfile,
+    output_target: str = "pipe:1",
+) -> list[str]:
+    ffmpeg_path = selection.ffmpeg_path or resolve_ffmpeg_binary()
+    if ffmpeg_path is None:
+        raise RuntimeError("FFmpeg is not available for the desktop duplication pipeline.")
+
+    runtime = build_h264_runtime_profile(
+        selection,
+        width=output_width,
+        height=output_height,
+        fps=fps,
+        quality_profile=quality_profile,
+    )
+
+    filter_chain = ["hwdownload", "format=bgra", f"fps={fps}"]
+    if input_width != output_width or input_height != output_height:
+        filter_chain.append(f"scale={output_width}:{output_height}:flags=fast_bilinear")
+
+    command = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-fflags",
+        "+genpts",
+        "-f",
+        "lavfi",
+        "-i",
+        (
+            f"ddagrab=output_idx={max(0, monitor_index - 1)}:"
+            f"framerate={fps}:video_size={input_width}x{input_height}:draw_mouse=1:dup_frames=1"
+        ),
+        "-vf",
+        ",".join(filter_chain),
+        "-an",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:v",
+        selection.codec,
+        "-profile:v",
+        "baseline",
+        "-b:v",
+        quality_profile.target_bitrate,
+        "-maxrate:v",
+        quality_profile.max_bitrate,
+        "-bufsize:v",
+        quality_profile.buffer_size,
+    ]
+
+    command.extend(
+        [
+            "-preset",
+            runtime.options["preset"],
+            "-tune",
+            runtime.options["tune"],
+            "-rc",
+            runtime.options["rc"],
+            "-g",
+            str(runtime.gop_size),
+            "-bf",
+            "0",
+            "-forced-idr",
+            "1",
+            "-zerolatency",
+            "1",
+            "-spatial_aq",
+            runtime.options["spatial_aq"],
+            "-aq-strength",
+            runtime.options["aq-strength"],
+            "-temporal_aq",
+            runtime.options["temporal_aq"],
+            "-rc-lookahead",
+            runtime.options["rc-lookahead"],
+            "-force_key_frames",
+            "expr:gte(t,n_forced*1)",
+        ]
+    )
+
+    command.extend(
+        [
+            "-bsf:v",
+            "dump_extra=freq=keyframe",
+            "-f",
+            "mpegts",
+            "-mpegts_flags",
+            "resend_headers",
+            "-muxdelay",
+            "0",
+            "-muxpreload",
+            "0",
+            "-flush_packets",
+            "1",
+            output_target,
+        ]
+    )
+    return command
+
+
 class FFmpegEncoderPipeline:
     """Optional subprocess encoder that can be used for raw frame offloading."""
 
@@ -510,6 +618,12 @@ def detect_nvidia_gpu() -> GpuInfo | None:
     else:
         gpu = None
     return gpu
+
+
+def ffmpeg_supports_filter(ffmpeg_path: str | None, filter_name: str) -> bool:
+    if ffmpeg_path is None:
+        return False
+    return filter_name in _read_filters(ffmpeg_path)
 
 
 def parse_bitrate_to_bps(bitrate_str: str) -> int:
@@ -751,3 +865,23 @@ def _read_encoders(ffmpeg_path: str) -> set[str]:
         for line in result.stdout.splitlines()
         if line.startswith(" V") and len(line.split()) >= 2
     }
+
+
+def _read_filters(ffmpeg_path: str) -> set[str]:
+    try:
+        result = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-filters"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=3,
+        )
+    except Exception:
+        return set()
+
+    filters: set[str] = set()
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].startswith("."):
+            filters.add(parts[1])
+    return filters
