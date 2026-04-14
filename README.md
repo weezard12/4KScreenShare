@@ -1,3 +1,5 @@
+# Warning - this app was AI Generated!
+This app was created by an AI, it's fully safe to run but im just letting you know that its ai generated.
 # 4K Screen Share
 
 Cross-platform Python desktop app for peer-to-peer screen sharing with audio. The same executable launches both modes:
